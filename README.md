@@ -1,3 +1,139 @@
+def receiver_aesa(group, port):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind(("", port))
+
+    mreq = struct.pack(
+        "4sl",
+        socket.inet_aton(group),
+        socket.INADDR_ANY
+    )
+
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        mreq
+    )
+
+    print(f"Listening AESA multicast {group}:{port}")
+
+    while True:
+
+        pkt, _ = sock.recvfrom(65535)
+
+        # -----------------------------------------
+        # AESA header must be exactly at least 28 bytes
+        # -----------------------------------------
+
+        if len(pkt) < AESA_HEADER_SIZE:
+            continue
+
+        # -----------------------------------------
+        # Decode 28-byte AESA message header
+        # -----------------------------------------
+
+        header = struct.unpack(
+            AESA_HEADER_FMT,
+            pkt[:AESA_HEADER_SIZE]
+        )
+
+        # -----------------------------------------
+        # Extract AESA header fields
+        # -----------------------------------------
+
+        msg_code = header[0]
+        msg_year = header[1]
+        msg_month = header[2]
+        msg_day = header[3]
+        msg_tod = header[4]
+        msg_size = header[5]
+        msg_source_id = header[6]
+        msg_destination_id = header[7]
+        msg_serial_num = header[8]
+
+        # -----------------------------------------
+        # Print received AESA header
+        # -----------------------------------------
+
+        print("\n========== AESA MESSAGE ==========")
+
+        print("Message Code       :", msg_code)
+        print("Message Year       :", msg_year)
+        print("Message Month      :", msg_month)
+        print("Message Day        :", msg_day)
+        print("Message TOD        :", msg_tod)
+        print("Message Size       :", msg_size)
+        print("Message Source ID  :", msg_source_id)
+        print("Message Destination:", msg_destination_id)
+        print("Message Serial No  :", msg_serial_num)
+
+        # -----------------------------------------
+        # Payload starts after 28-byte header
+        # -----------------------------------------
+
+        payload = pkt[AESA_HEADER_SIZE:]
+
+        print("Payload bytes      :", len(payload))
+
+        # -----------------------------------------
+        # Message code is your OPCODE
+        # -----------------------------------------
+
+        opcode = msg_code
+
+        # -----------------------------------------
+        # Decode payload according to message code
+        # -----------------------------------------
+
+        try:
+
+            decoded, labels = decode_from_icd(
+                opcode,
+                payload
+            )
+
+        except Exception as e:
+
+            print(
+                f"Decode error opcode {opcode}: {e}"
+            )
+
+            continue
+
+        # -----------------------------------------
+        # Use serial number as packet number
+        # -----------------------------------------
+
+        packet_no = msg_serial_num
+
+        # -----------------------------------------
+        # Store / log
+        # -----------------------------------------
+
+        # NOTE:
+        # msg_tod is not converted to timestamp here
+        # because its exact unit is not specified.
+
+        print("Decoded:", decoded)
+
+        logger_rx.log(
+            packet_no,
+            opcode,
+            decoded,
+            labels,
+            msg_tod
+        )
 import sys
 import pandas as pd
 import numpy as np
@@ -197,7 +333,286 @@ class ReplayPlotWindow(QtWidgets.QWidget):
                                    x_data[-1] + RIGHT_MARGIN, padding=0)
 
 
-# =====================================================
+# def receiver_aesa(group, port):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind(("", port))
+
+    mreq = struct.pack(
+        "4sl",
+        socket.inet_aton(group),
+        socket.INADDR_ANY
+    )
+
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        mreq
+    )
+
+    print(f"Listening AESA multicast {group}:{port}")
+
+    while True:
+
+        pkt, _ = sock.recvfrom(65535)
+
+        # -----------------------------------------
+        # AESA header must be exactly at least 28 bytes
+        # -----------------------------------------
+
+        if len(pkt) < AESA_HEADER_SIZE:
+            continue
+
+        # -----------------------------------------
+        # Decode 28-byte AESA message header
+        # -----------------------------------------
+
+        header = struct.unpack(
+            AESA_HEADER_FMT,
+            pkt[:AESA_HEADER_SIZE]
+        )
+
+        # -----------------------------------------
+        # Extract AESA header fields
+        # -----------------------------------------
+
+        msg_code = header[0]
+        msg_year = header[1]
+        msg_month = header[2]
+        msg_day = header[3]
+        msg_tod = header[4]
+        msg_size = header[5]
+        msg_source_id = header[6]
+        msg_destination_id = header[7]
+        msg_serial_num = header[8]
+
+        # -----------------------------------------
+        # Print received AESA header
+        # -----------------------------------------
+
+        print("\n========== AESA MESSAGE ==========")
+
+        print("Message Code       :", msg_code)
+        print("Message Year       :", msg_year)
+        print("Message Month      :", msg_month)
+        print("Message Day        :", msg_day)
+        print("Message TOD        :", msg_tod)
+        print("Message Size       :", msg_size)
+        print("Message Source ID  :", msg_source_id)
+        print("Message Destination:", msg_destination_id)
+        print("Message Serial No  :", msg_serial_num)
+
+        # -----------------------------------------
+        # Payload starts after 28-byte header
+        # -----------------------------------------
+
+        payload = pkt[AESA_HEADER_SIZE:]
+
+        print("Payload bytes      :", len(payload))
+
+        # -----------------------------------------
+        # Message code is your OPCODE
+        # -----------------------------------------
+
+        opcode = msg_code
+
+        # -----------------------------------------
+        # Decode payload according to message code
+        # -----------------------------------------
+
+        try:
+
+            decoded, labels = decode_from_icd(
+                opcode,
+                payload
+            )
+
+        except Exception as e:
+
+            print(
+                f"Decode error opcode {opcode}: {e}"
+            )
+
+            continue
+
+        # -----------------------------------------
+        # Use serial number as packet number
+        # -----------------------------------------
+
+        packet_no = msg_serial_num
+
+        # -----------------------------------------
+        # Store / log
+        # -----------------------------------------
+
+        # NOTE:
+        # msg_tod is not converted to timestamp here
+        # because its exact unit is not specified.
+
+        print("Decoded:", decoded)
+
+        logger_rx.log(
+            packet_no,
+            opcode,
+            decoded,
+            labels,
+            msg_tod
+
+
+
+
+
+
+            
+def receiver_aesa(group, port):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind(("", port))
+
+    mreq = struct.pack(
+        "4sl",
+        socket.inet_aton(group),
+        socket.INADDR_ANY
+    )
+
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        mreq
+    )
+
+    print(f"Listening AESA multicast {group}:{port}")
+
+    while True:
+
+        pkt, _ = sock.recvfrom(65535)
+
+        # -----------------------------------------
+        # AESA header must be exactly at least 28 bytes
+        # -----------------------------------------
+
+        if len(pkt) < AESA_HEADER_SIZE:
+            continue
+
+        # -----------------------------------------
+        # Decode 28-byte AESA message header
+        # -----------------------------------------
+
+        header = struct.unpack(
+            AESA_HEADER_FMT,
+            pkt[:AESA_HEADER_SIZE]
+        )
+
+        # -----------------------------------------
+        # Extract AESA header fields
+        # -----------------------------------------
+
+        msg_code = header[0]
+        msg_year = header[1]
+        msg_month = header[2]
+        msg_day = header[3]
+        msg_tod = header[4]
+        msg_size = header[5]
+        msg_source_id = header[6]
+        msg_destination_id = header[7]
+        msg_serial_num = header[8]
+
+        # -----------------------------------------
+        # Print received AESA header
+        # -----------------------------------------
+
+        print("\n========== AESA MESSAGE ==========")
+
+        print("Message Code       :", msg_code)
+        print("Message Year       :", msg_year)
+        print("Message Month      :", msg_month)
+        print("Message Day        :", msg_day)
+        print("Message TOD        :", msg_tod)
+        print("Message Size       :", msg_size)
+        print("Message Source ID  :", msg_source_id)
+        print("Message Destination:", msg_destination_id)
+        print("Message Serial No  :", msg_serial_num)
+
+        # -----------------------------------------
+        # Payload starts after 28-byte header
+        # -----------------------------------------
+
+        payload = pkt[AESA_HEADER_SIZE:]
+
+        print("Payload bytes      :", len(payload))
+
+        # -----------------------------------------
+        # Message code is your OPCODE
+        # -----------------------------------------
+
+        opcode = msg_code
+
+        # -----------------------------------------
+        # Decode payload according to message code
+        # -----------------------------------------
+
+        try:
+
+            decoded, labels = decode_from_icd(
+                opcode,
+                payload
+            )
+
+        except Exception as e:
+
+            print(
+                f"Decode error opcode {opcode}: {e}"
+            )
+
+            continue
+
+        # -----------------------------------------
+        # Use serial number as packet number
+        # -----------------------------------------
+
+        packet_no = msg_serial_num
+
+        # -----------------------------------------
+        # Store / log
+        # -----------------------------------------
+
+        # NOTE:
+        # msg_tod is not converted to timestamp here
+        # because its exact unit is not specified.
+
+        print("Decoded:", decoded)
+
+        logger_rx.log(
+            packet_no,
+            opcode,
+            decoded,
+            labels,
+            msg_tod
+        )
+
+        )=====================================================
 # MAIN
 # =====================================================
 def main():
@@ -291,3 +706,11 @@ def aesa_receiver(group, port):
         except Exception as e:
             print(f"Decode error opcode {opcode}: {e}")
             continue
+
+            
+
+            
+
+
+
+            
