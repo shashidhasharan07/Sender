@@ -205,6 +205,8 @@ def main():
     file_path = "Book1.csv"  # <-- change to your CSV
     df = pd.read_csv(file_path)
 
+
+
     window = ReplayPlotWindow(df)
     window.show()
 
@@ -213,3 +215,79 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+def aesa_receiver(group, port):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind(("", port))
+
+    mreq = struct.pack(
+        "4sl",
+        socket.inet_aton(group),
+        socket.INADDR_ANY
+    )
+
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        mreq
+    )
+
+    print(f"Listening AESA multicast {group}:{port}")
+
+    while True:
+
+        pkt, _ = sock.recvfrom(65535)
+
+        # AESA header is 28 bytes
+        if len(pkt) < AESA_HEADER_SIZE:
+            continue
+
+        # Decode 28-byte AESA header
+        header = struct.unpack(
+            AESA_HEADER_FMT,
+            pkt[:AESA_HEADER_SIZE]
+        )
+
+        # First field is Message Code = OPCODE
+        opcode = header[0]
+
+        # Remaining AESA fields
+        message_day   = header[1]
+        message_month = header[2]
+        message_tod   = header[3]
+
+        param5 = header[4]
+        param6 = header[5]
+        param7 = header[6]
+        param8 = header[7]
+        param9 = header[8]
+
+        print("AESA OPCODE:", opcode)
+        print("Day:", message_day)
+        print("Month:", message_month)
+        print("TOD:", message_tod)
+
+        # Decode according to opcode
+        try:
+            decoded, labels = decode_from_icd(opcode, pkt)
+        except Exception as e:
+            print(f"Decode error opcode {opcode}: {e}")
+            continue
