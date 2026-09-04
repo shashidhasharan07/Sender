@@ -1,1922 +1,1440 @@
 import struct
-import sys
-import os
 import csv
+import os
 from datetime import datetime, timezone
-from io import BytesIO
-from collections import defaultdict
 
 
 # ============================================================
-# USER CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-# Where is the opcode inside the SDR payload?
-#
-# If opcode is the first byte:
+# Your protocol is assumed to use big-endian payload values.
+PAYLOAD_BYTEORDER = "big"
+
+# One complete target message
+MESSAGE_SIZE = 130
+
+# Header inside one message
+HEADER_SIZE = 28
+
+# First byte of the application message is assumed to be Opcode
 OPCODE_OFFSET = 0
 
-# Opcode data type.
-#
-# "<B"  = unsigned 1 byte
-# "<H"  = unsigned 2 bytes
-# "<I"  = unsigned 4 bytes
-# "<h"  = signed 2 bytes
-# "<i"  = signed 4 bytes
-# "<f"  = 4 byte float
-# "<d"  = 8 byte double
-#
-# Change this if your ICD uses another format.
-OPCODE_FORMAT = "<B"
-
+# Number of targets is assumed to be the second byte.
+TARGET_COUNT_OFFSET = 1
 
 # ------------------------------------------------------------
-# If every SDR message has a fixed header before opcode,
-# change OPCODE_OFFSET.
-#
-# Example:
-#
-# 28-byte header + opcode:
-#
-# OPCODE_OFFSET = 28
-#
-# ------------------------------------------------------------
-
-
-# ============================================================
-# SDR OPCODE DEFINITIONS
-# ============================================================
+# Current generic target layout
 #
 # IMPORTANT:
+# The uploaded file does NOT contain the actual protocol
+# definition for the 28-byte header / 102-byte parameter area.
 #
-# Replace these examples with your ACTUAL ICD definitions.
-#
-# Format:
-#
-# opcode:
-# {
-#     "name": "Opcode name",
-#     "target_count_offset": None,
-#     "target_count_format": None,
-#     "target_size": number of bytes,
-#     "fields": [
-#         (name, format),
-#         (name, format),
-#     ]
-# }
-#
-# The fields are relative to the beginning of EACH target.
-#
+# Therefore these are only safe generic fields.
 # ------------------------------------------------------------
 
-OPCODE_DEFINITIONS = {
-
-    # --------------------------------------------------------
-    # EXAMPLE OPCODE 101
-    # --------------------------------------------------------
-
-    101: {
-        "name": "Example_Target_Data",
-
-        # If one packet contains multiple targets and the
-        # number of targets is stored in the packet:
-        #
-        # Example:
-        # target_count_offset = 1
-        # target_count_format = "<B"
-        #
-        # If there is only one target, use None.
-
-        "target_count_offset": None,
-        "target_count_format": None,
-
-        # Total bytes occupied by ONE target.
-        #
-        # Example below:
-        # rssi       2 bytes
-        # frequency  4 bytes
-        # snr        4 bytes
-        # azimuth    4 bytes
-        # range      4 bytes
-        #
-        # Total = 18 bytes
-        #
-        "target_size": 18,
-
-        "fields": [
-            ("rssi", "<h"),
-            ("frequency", "<f"),
-            ("snr", "<f"),
-            ("azimuth", "<f"),
-            ("range", "<f"),
-        ]
-    },
-
-
-    # --------------------------------------------------------
-    # EXAMPLE OPCODE 104
-    # --------------------------------------------------------
-
-    104: {
-        "name": "Example_Track_Data",
-
-        "target_count_offset": None,
-        "target_count_format": None,
-
-        "target_size": 17,
-
-        "fields": [
-            ("target_id", "<B"),
-            ("velocity", "<f"),
-            ("heading", "<f"),
-            ("altitude", "<f"),
-            ("status_flag", "<B"),
-        ]
-    },
-
-
-    # --------------------------------------------------------
-    # ADD YOUR OTHER OPCODES HERE
-    # --------------------------------------------------------
-    #
-    # Example:
-    #
-    # 107: {
-    #     "name": "Your_Opcode_107",
-    #     "target_count_offset": 1,
-    #     "target_count_format": "<B",
-    #     "target_size": 20,
-    #     "fields": [
-    #         ("parameter1", "<H"),
-    #         ("parameter2", "<I"),
-    #         ("parameter3", "<f"),
-    #         ("parameter4", "<f"),
-    #     ]
-    # },
-    #
-}
+GENERIC_TARGET_FIELDS = [
+    "GlobalID",
+    "Latitude",
+    "Longitude",
+    "Altitude",
+    "Bitfield",
+    "Enum"
+]
 
 
 # ============================================================
-# ERROR LOG
+# BYTE ORDER HELPERS
 # ============================================================
 
-ERROR_FILE = "errors.log"
+def normalize_byteorder(byteorder):
+    """
+    Converts Python/struct style endian values into
+    'big' or 'little'.
+    """
+
+    if byteorder in ("big", ">","!"):
+        return "big"
+
+    if byteorder in ("little", "<"):
+        return "little"
+
+    raise ValueError(
+        f"Invalid byteorder {byteorder!r}. "
+        "Expected big, little, >, < or !"
+    )
 
 
-def log_error(message):
+def read_u8(data, pos):
+    if pos < 0 or pos + 1 > len(data):
+        raise ValueError(f"Cannot read u8 at offset {pos}")
 
-    with open(ERROR_FILE, "a", encoding="utf-8") as f:
-        f.write(message + "\n")
-
-
-# ============================================================
-# SAFE STRUCT UNPACK
-# ============================================================
-
-def unpack_value(data, offset, fmt):
-
-    try:
-
-        size = struct.calcsize(fmt)
-
-        if offset < 0:
-            return None, size
-
-        if offset + size > len(data):
-            return None, size
-
-        value = struct.unpack_from(fmt, data, offset)[0]
-
-        return value, size
-
-    except Exception:
-
-        return None, 0
+    return data[pos]
 
 
-# ============================================================
-# TIMESTAMP
-# ============================================================
+def read_u16(data, pos, byteorder="big"):
+    byteorder = normalize_byteorder(byteorder)
 
-def timestamp_to_string(timestamp_raw, resolution):
+    if pos < 0 or pos + 2 > len(data):
+        raise ValueError(f"Cannot read u16 at offset {pos}")
 
-    try:
-
-        seconds = timestamp_raw * resolution
-
-        dt = datetime.fromtimestamp(
-            seconds,
-            timezone.utc
-        )
-
-        return dt.isoformat()
-
-    except Exception:
-
-        return ""
+    return int.from_bytes(
+        data[pos:pos + 2],
+        byteorder=byteorder,
+        signed=False
+    )
 
 
-# ============================================================
-# MAC ADDRESS
-# ============================================================
+def read_u32(data, pos, byteorder="big"):
+    byteorder = normalize_byteorder(byteorder)
 
-def mac_address(data):
+    if pos < 0 or pos + 4 > len(data):
+        raise ValueError(f"Cannot read u32 at offset {pos}")
 
-    if len(data) != 6:
-        return ""
+    return int.from_bytes(
+        data[pos:pos + 4],
+        byteorder=byteorder,
+        signed=False
+    )
 
-    return ":".join(
-        f"{x:02X}" for x in data
+
+def read_i32(data, pos, byteorder="big"):
+    byteorder = normalize_byteorder(byteorder)
+
+    if pos < 0 or pos + 4 > len(data):
+        raise ValueError(f"Cannot read i32 at offset {pos}")
+
+    return int.from_bytes(
+        data[pos:pos + 4],
+        byteorder=byteorder,
+        signed=True
     )
 
 
 # ============================================================
-# IPv4 ADDRESS
+# GENERIC VALUE DECODERS
 # ============================================================
 
-def ipv4_address(data):
-
-    if len(data) != 4:
+def decode_uint(data, byteorder):
+    if len(data) == 0:
         return ""
 
-    return ".".join(
-        str(x) for x in data
+    return int.from_bytes(
+        data,
+        byteorder=normalize_byteorder(byteorder),
+        signed=False
     )
 
 
-# ============================================================
-# IPv6 ADDRESS
-# ============================================================
-
-def ipv6_address(data):
-
-    if len(data) != 16:
+def decode_int(data, byteorder):
+    if len(data) == 0:
         return ""
 
-    values = []
+    return int.from_bytes(
+        data,
+        byteorder=normalize_byteorder(byteorder),
+        signed=True
+    )
 
-    for i in range(0, 16, 2):
 
-        values.append(
-            f"{data[i]:02X}{data[i + 1]:02X}"
-        )
+def decode_value(data, byteorder="big", signed=False):
+    """
+    Generic decoder.
 
-    return ":".join(values)
+    1 byte  -> integer
+    2 bytes -> integer
+    4 bytes -> integer
+    8 bytes -> integer
+
+    Other lengths are returned as a decimal integer too.
+    """
+
+    if not data:
+        return ""
+
+    if signed:
+        return decode_int(data, byteorder)
+
+    return decode_uint(data, byteorder)
 
 
 # ============================================================
-# EXTRACT NETWORK PAYLOAD
+# NETWORK PACKET EXTRACTION
 # ============================================================
 
-def extract_sdr_payload(packet):
+def extract_application_payload(packet):
+    """
+    Extract application payload from:
 
-    result = {
-        "source": "",
-        "destination": "",
-        "source_port": "",
-        "destination_port": "",
-        "protocol": "",
-        "payload": b""
-    }
+        Ethernet
+        VLAN (optional)
+        IPv4 / IPv6
+        TCP / UDP
+
+    Only returns application payload.
+
+    No network information is written to CSV.
+    """
+
+    if not packet:
+        return b""
 
     # --------------------------------------------------------
     # Ethernet
     # --------------------------------------------------------
 
     if len(packet) < 14:
+        return b""
 
-        # Do not drop packet.
-        # Treat entire packet as custom payload.
-
-        result["protocol"] = "UNKNOWN"
-        result["payload"] = packet
-
-        return result
-
-    result["destination"] = mac_address(
-        packet[0:6]
+    ether_type = int.from_bytes(
+        packet[12:14],
+        byteorder="big"
     )
-
-    result["source"] = mac_address(
-        packet[6:12]
-    )
-
-    ether_type = struct.unpack(
-        ">H",
-        packet[12:14]
-    )[0]
 
     pos = 14
-
 
     # --------------------------------------------------------
     # VLAN
     # --------------------------------------------------------
 
-    while ether_type in (
-        0x8100,
-        0x88A8,
-        0x9100
-    ):
+    while ether_type in (0x8100, 0x88A8, 0x9100):
 
         if len(packet) < pos + 4:
+            return b""
 
-            result["protocol"] = "VLAN"
-            result["payload"] = packet[pos:]
-
-            return result
-
-        ether_type = struct.unpack(
-            ">H",
-            packet[pos + 2:pos + 4]
-        )[0]
+        ether_type = int.from_bytes(
+            packet[pos + 2:pos + 4],
+            byteorder="big"
+        )
 
         pos += 4
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # IPv4
-    # ========================================================
+    # --------------------------------------------------------
 
     if ether_type == 0x0800:
 
         if len(packet) < pos + 20:
-
-            result["protocol"] = "IPv4"
-            result["payload"] = packet[pos:]
-
-            return result
+            return b""
 
         version_ihl = packet[pos]
 
-        ihl = (
-            version_ihl & 0x0F
-        ) * 4
+        version = version_ihl >> 4
+
+        if version != 4:
+            return b""
+
+        ihl = (version_ihl & 0x0F) * 4
+
+        if ihl < 20:
+            return b""
 
         if len(packet) < pos + ihl:
+            return b""
 
-            result["protocol"] = "IPv4"
-            result["payload"] = packet[pos:]
+        protocol = packet[pos + 9]
 
-            return result
-
-        result["source"] = ipv4_address(
-            packet[pos + 12:pos + 16]
-        )
-
-        result["destination"] = ipv4_address(
-            packet[pos + 16:pos + 20]
-        )
-
-        protocol_number = packet[pos + 9]
-
-        transport = pos + ihl
-
-
-        # ----------------------------------------------------
-        # UDP
-        # ----------------------------------------------------
-
-        if protocol_number == 17:
-
-            result["protocol"] = "UDP"
-
-            if len(packet) < transport + 8:
-
-                result["payload"] = packet[transport:]
-
-                return result
-
-            result["source_port"] = struct.unpack(
-                ">H",
-                packet[transport:transport + 2]
-            )[0]
-
-            result["destination_port"] = struct.unpack(
-                ">H",
-                packet[transport + 2:transport + 4]
-            )[0]
-
-            udp_length = struct.unpack(
-                ">H",
-                packet[transport + 4:transport + 6]
-            )[0]
-
-            payload_start = transport + 8
-
-            payload_end = len(packet)
-
-            if udp_length >= 8:
-
-                calculated_end = (
-                    transport + udp_length
-                )
-
-                if calculated_end < payload_end:
-                    payload_end = calculated_end
-
-            result["payload"] = packet[
-                payload_start:payload_end
-            ]
-
-            return result
-
+        transport_pos = pos + ihl
 
         # ----------------------------------------------------
         # TCP
         # ----------------------------------------------------
 
-        elif protocol_number == 6:
+        if protocol == 6:
 
-            result["protocol"] = "TCP"
+            if len(packet) < transport_pos + 20:
+                return b""
 
-            if len(packet) < transport + 20:
+            tcp_data_offset = (
+                packet[transport_pos + 12] >> 4
+            ) * 4
 
-                result["payload"] = packet[transport:]
+            if tcp_data_offset < 20:
+                return b""
 
-                return result
-
-            result["source_port"] = struct.unpack(
-                ">H",
-                packet[transport:transport + 2]
-            )[0]
-
-            result["destination_port"] = struct.unpack(
-                ">H",
-                packet[transport + 2:transport + 4]
-            )[0]
-
-            data_offset = (
-                (packet[transport + 12] >> 4)
-                * 4
+            payload_pos = (
+                transport_pos + tcp_data_offset
             )
 
-            payload_start = (
-                transport + data_offset
-            )
+            if payload_pos > len(packet):
+                return b""
 
-            result["payload"] = packet[
-                payload_start:
-            ]
-
-            return result
-
+            return packet[payload_pos:]
 
         # ----------------------------------------------------
-        # Other IPv4 protocol
+        # UDP
         # ----------------------------------------------------
 
-        else:
+        if protocol == 17:
 
-            result["protocol"] = (
-                f"IP({protocol_number})"
-            )
+            if len(packet) < transport_pos + 8:
+                return b""
 
-            result["payload"] = packet[
-                transport:
-            ]
+            payload_pos = transport_pos + 8
 
-            return result
+            if payload_pos > len(packet):
+                return b""
 
+            return packet[payload_pos:]
 
-    # ========================================================
+        return packet[transport_pos:]
+
+    # --------------------------------------------------------
     # IPv6
-    # ========================================================
+    # --------------------------------------------------------
 
     elif ether_type == 0x86DD:
 
         if len(packet) < pos + 40:
-
-            result["protocol"] = "IPv6"
-            result["payload"] = packet[pos:]
-
-            return result
-
-        result["source"] = ipv6_address(
-            packet[pos + 8:pos + 24]
-        )
-
-        result["destination"] = ipv6_address(
-            packet[pos + 24:pos + 40]
-        )
+            return b""
 
         next_header = packet[pos + 6]
 
-        transport = pos + 40
+        transport_pos = pos + 40
 
+        # Basic IPv6 extension-header handling
+        while next_header in (
+            0,
+            43,
+            44,
+            50,
+            51,
+            60
+        ):
 
-        # UDP
+            if next_header == 44:
+                # Fragment header = 8 bytes
+                if len(packet) < transport_pos + 8:
+                    return b""
+
+                next_header = packet[
+                    transport_pos
+                ]
+
+                transport_pos += 8
+
+            elif next_header == 50:
+                # ESP.
+                # Cannot reliably locate application payload.
+                return b""
+
+            elif next_header == 51:
+                # Authentication header.
+                if len(packet) < transport_pos + 2:
+                    return b""
+
+                next_header_value = packet[
+                    transport_pos
+                ]
+
+                payload_len_units = packet[
+                    transport_pos + 1
+                ]
+
+                header_len = (
+                    (payload_len_units + 2) * 4
+                )
+
+                if len(packet) < transport_pos + header_len:
+                    return b""
+
+                next_header = next_header_value
+
+                transport_pos += header_len
+
+            else:
+                # Hop-by-hop, routing, destination options
+                if len(packet) < transport_pos + 2:
+                    return b""
+
+                next_header_value = packet[
+                    transport_pos
+                ]
+
+                ext_len = (
+                    packet[transport_pos + 1] + 1
+                ) * 8
+
+                if len(packet) < transport_pos + ext_len:
+                    return b""
+
+                next_header = next_header_value
+
+                transport_pos += ext_len
+
+        # ----------------------------------------------------
+        # IPv6 TCP
+        # ----------------------------------------------------
+
+        if next_header == 6:
+
+            if len(packet) < transport_pos + 20:
+                return b""
+
+            tcp_header_len = (
+                packet[transport_pos + 12] >> 4
+            ) * 4
+
+            if tcp_header_len < 20:
+                return b""
+
+            payload_pos = (
+                transport_pos + tcp_header_len
+            )
+
+            if payload_pos > len(packet):
+                return b""
+
+            return packet[payload_pos:]
+
+        # ----------------------------------------------------
+        # IPv6 UDP
+        # ----------------------------------------------------
+
         if next_header == 17:
 
-            result["protocol"] = "UDP"
+            if len(packet) < transport_pos + 8:
+                return b""
 
-            if len(packet) < transport + 8:
+            payload_pos = transport_pos + 8
 
-                result["payload"] = packet[transport:]
+            if payload_pos > len(packet):
+                return b""
 
-                return result
+            return packet[payload_pos:]
 
-            result["source_port"] = struct.unpack(
-                ">H",
-                packet[transport:transport + 2]
-            )[0]
+        return packet[transport_pos:]
 
-            result["destination_port"] = struct.unpack(
-                ">H",
-                packet[transport + 2:transport + 4]
-            )[0]
+    # --------------------------------------------------------
+    # Non-IP
+    # --------------------------------------------------------
 
-            result["payload"] = packet[
-                transport + 8:
-            ]
-
-            return result
+    return b""
 
 
-        # TCP
-        elif next_header == 6:
+# ============================================================
+# APPLICATION MESSAGE DECODER
+# ============================================================
 
-            result["protocol"] = "TCP"
+def decode_single_message(message):
+    """
+    Decode one 130-byte application message.
 
-            if len(packet) < transport + 20:
+    Current known information:
+        message size = 130
+        header       = 28
 
-                result["payload"] = packet[transport:]
+    Opcode:
+        byte 0
 
-                return result
+    Target count:
+        byte 1
 
-            result["source_port"] = struct.unpack(
-                ">H",
-                packet[transport:transport + 2]
-            )[0]
+    The remaining protocol-specific structure is NOT present
+    in the uploaded Python file, so the decoder does not invent
+    parameter names/types.
+    """
 
-            result["destination_port"] = struct.unpack(
-                ">H",
-                packet[transport + 2:transport + 4]
-            )[0]
+    result = {
+        "Opcode": "",
+        "Target_Count": "",
+        "Parameters": {},
+        "Targets": []
+    }
 
-            data_offset = (
-                (packet[transport + 12] >> 4)
-                * 4
-            )
+    if not message:
+        return result
 
-            result["payload"] = packet[
-                transport + data_offset:
-            ]
+    if len(message) < 2:
+        return result
 
-            return result
+    # --------------------------------------------------------
+    # Opcode
+    # --------------------------------------------------------
 
+    result["Opcode"] = message[OPCODE_OFFSET]
 
-        else:
+    # --------------------------------------------------------
+    # Target count
+    # --------------------------------------------------------
 
-            result["protocol"] = (
-                f"IPv6({next_header})"
-            )
+    result["Target_Count"] = message[
+        TARGET_COUNT_OFFSET
+    ]
 
-            result["payload"] = packet[
-                transport:
-            ]
+    target_count = result["Target_Count"]
 
-            return result
+    # --------------------------------------------------------
+    # Header
+    # --------------------------------------------------------
 
+    header_end = min(
+        HEADER_SIZE,
+        len(message)
+    )
 
-    # ========================================================
-    # Non-IP Ethernet
-    # ========================================================
+    header = message[:header_end]
 
-    else:
+    # --------------------------------------------------------
+    # Parameter area
+    # --------------------------------------------------------
 
-        result["protocol"] = (
-            f"EtherType_0x{ether_type:04X}"
+    parameter_area = message[header_end:]
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # We cannot safely invent the parameter names here.
+    #
+    # The uploaded file only contained the old guessed fields:
+    # GlobalID, Latitude, Longitude, Altitude, Bitfield, Enum.
+    #
+    # Instead of generating fake parameter names/values,
+    # preserve the parameter area internally.
+    # --------------------------------------------------------
+
+    # If there is no target information, treat this as a
+    # generic opcode message.
+    if target_count == 0:
+        result["Parameters"] = decode_generic_parameters(
+            parameter_area
         )
-
-        result["payload"] = packet[pos:]
 
         return result
 
-
-# ============================================================
-# GET OPCODE
-# ============================================================
-
-def get_opcode(payload):
-
-    try:
-
-        value = struct.unpack_from(
-            OPCODE_FORMAT,
-            payload,
-            OPCODE_OFFSET
-        )[0]
-
-        return value
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# DECODE UNKNOWN OPCODE
-# ============================================================
-
-def decode_unknown(payload):
-
-    result = {}
-
-    start = OPCODE_OFFSET + struct.calcsize(
-        OPCODE_FORMAT
-    )
-
-    remaining = payload[start:]
-
     # --------------------------------------------------------
-    # Keep every remaining byte.
+    # Target messages
     #
-    # Divide into individual bytes so no data disappears.
+    # 130-byte message
+    # 28-byte header
+    # leaves 102 bytes.
+    #
+    # We cannot know the exact target size without the protocol
+    # definition.
+    #
+    # For now, if target count divides 102, divide equally.
     # --------------------------------------------------------
 
-    for i, value in enumerate(
-        remaining,
-        1
-    ):
+    if target_count > 0:
 
-        result[f"param_{i}"] = (
-            f"0x{value:02X}"
-        )
+        remaining_size = len(parameter_area)
 
-    return [result]
+        if remaining_size % target_count == 0:
 
-
-# ============================================================
-# DECODE KNOWN OPCODE
-# ============================================================
-
-def decode_known_opcode(
-    payload,
-    opcode,
-    definition
-):
-
-    fields = definition.get(
-        "fields",
-        []
-    )
-
-    target_size = definition.get(
-        "target_size"
-    )
-
-    target_count_offset = definition.get(
-        "target_count_offset"
-    )
-
-    target_count_format = definition.get(
-        "target_count_format"
-    )
-
-
-    # --------------------------------------------------------
-    # Determine target count
-    # --------------------------------------------------------
-
-    if (
-        target_count_offset is not None
-        and target_count_format is not None
-    ):
-
-        count, size = unpack_value(
-            payload,
-            OPCODE_OFFSET + target_count_offset,
-            target_count_format
-        )
-
-        if count is None or count < 1:
-
-            target_count = 1
-
-        else:
-
-            target_count = int(count)
-
-    else:
-
-        # If no target count is defined,
-        # calculate number of targets from payload size.
-
-        data_start = (
-            OPCODE_OFFSET
-            + struct.calcsize(OPCODE_FORMAT)
-        )
-
-        available = len(payload) - data_start
-
-        if target_size and target_size > 0:
-
-            target_count = (
-                available // target_size
+            target_size = (
+                remaining_size // target_count
             )
 
-            if target_count < 1:
-                target_count = 1
+            for index in range(target_count):
 
-        else:
-
-            target_count = 1
-
-
-    # --------------------------------------------------------
-    # Starting position of target data
-    # --------------------------------------------------------
-
-    data_start = (
-        OPCODE_OFFSET
-        + struct.calcsize(OPCODE_FORMAT)
-    )
-
-    rows = []
-
-
-    # ========================================================
-    # Decode each target separately
-    # ========================================================
-
-    for target_index in range(
-        target_count
-    ):
-
-        if target_size:
-
-            target_start = (
-                data_start
-                + target_index * target_size
-            )
-
-            target_end = (
-                target_start + target_size
-            )
-
-        else:
-
-            target_start = data_start
-            target_end = len(payload)
-
-
-        target_data = payload[
-            target_start:target_end
-        ]
-
-        row = {}
-
-        current_offset = 0
-
-
-        # ----------------------------------------------------
-        # Decode every configured field
-        # ----------------------------------------------------
-
-        for field_name, fmt in fields:
-
-            size = struct.calcsize(fmt)
-
-            value, actual_size = unpack_value(
-                target_data,
-                current_offset,
-                fmt
-            )
-
-            if value is None:
-
-                row[field_name] = ""
-
-                log_error(
-                    f"Opcode {opcode}, "
-                    f"target {target_index + 1}: "
-                    f"could not decode field "
-                    f"{field_name}"
+                start = (
+                    index * target_size
                 )
 
-            else:
+                end = (
+                    start + target_size
+                )
 
-                row[field_name] = value
+                target_data = parameter_area[
+                    start:end
+                ]
 
-            current_offset += size
+                target = decode_generic_target(
+                    target_data
+                )
+
+                result["Targets"].append(
+                    target
+                )
+
+        else:
+
+            # Cannot safely divide the parameter area.
+            # Keep it as one generic target.
+            result["Targets"].append(
+                decode_generic_target(
+                    parameter_area
+                )
+            )
+
+    return result
 
 
-        # ----------------------------------------------------
-        # If target contains bytes not described by ICD,
-        # preserve them as param_N fields.
-        # ----------------------------------------------------
+# ============================================================
+# GENERIC PARAMETER DECODER
+# ============================================================
 
-        remaining = target_data[
-            current_offset:
+def decode_generic_parameters(data):
+    """
+    Generic decoder used only when there are no targets.
+
+    It does NOT claim to know protocol parameter names.
+
+    Splits data into 4-byte unsigned integers where possible.
+    """
+
+    parameters = {}
+
+    if not data:
+        return parameters
+
+    full_words = len(data) // 4
+
+    for index in range(full_words):
+
+        start = index * 4
+
+        end = start + 4
+
+        value = decode_value(
+            data[start:end],
+            PAYLOAD_BYTEORDER,
+            signed=False
+        )
+
+        parameters[
+            f"Parameter_{index + 1}"
+        ] = value
+
+    remainder_start = full_words * 4
+
+    if remainder_start < len(data):
+
+        remainder = data[
+            remainder_start:
         ]
 
-        for i, value in enumerate(
-            remaining,
-            1
-        ):
+        parameters[
+            f"Parameter_{full_words + 1}"
+        ] = decode_value(
+            remainder,
+            PAYLOAD_BYTEORDER,
+            signed=False
+        )
 
-            row[
-                f"param_{i}"
-            ] = f"0x{value:02X}"
-
-
-        rows.append(row)
-
-
-    return rows
+    return parameters
 
 
 # ============================================================
-# DECODE SDR PAYLOAD
+# GENERIC TARGET DECODER
 # ============================================================
 
-def decode_sdr(payload):
+def decode_generic_target(data):
+    """
+    Generic target decoder.
 
-    opcode = get_opcode(payload)
+    This is intentionally conservative because the actual
+    protocol parameter definition is not present in the
+    uploaded Python file.
+    """
 
-    if opcode is None:
+    target = {}
 
-        return (
-            None,
-            "UNKNOWN",
-            [
-                {
-                    "param_1":
-                    "Unable to read opcode"
-                }
-            ]
+    length = len(data)
+
+    # --------------------------------------------------------
+    # If target has at least 4 bytes
+    # --------------------------------------------------------
+
+    if length >= 4:
+
+        target["GlobalID"] = decode_uint(
+            data[0:4],
+            PAYLOAD_BYTEORDER
         )
 
+    # --------------------------------------------------------
+    # If target has at least 8 bytes
+    # --------------------------------------------------------
 
-    definition = OPCODE_DEFINITIONS.get(
-        opcode
-    )
+    if length >= 8:
 
-
-    if definition is None:
-
-        return (
-            opcode,
-            f"Opcode_{opcode}",
-            decode_unknown(payload)
+        raw_latitude = decode_int(
+            data[4:8],
+            PAYLOAD_BYTEORDER
         )
 
-
-    try:
-
-        rows = decode_known_opcode(
-            payload,
-            opcode,
-            definition
+        target["Latitude"] = (
+            raw_latitude / 10000000.0
         )
 
-        return (
-            opcode,
-            definition.get(
-                "name",
-                f"Opcode_{opcode}"
-            ),
-            rows
+    # --------------------------------------------------------
+    # If target has at least 12 bytes
+    # --------------------------------------------------------
+
+    if length >= 12:
+
+        raw_longitude = decode_int(
+            data[8:12],
+            PAYLOAD_BYTEORDER
         )
 
-    except Exception as e:
-
-        log_error(
-            f"Opcode {opcode} decoding error: {e}"
+        target["Longitude"] = (
+            raw_longitude / 10000000.0
         )
 
-        return (
-            opcode,
-            definition.get(
-                "name",
-                f"Opcode_{opcode}"
-            ),
-            decode_unknown(payload)
+    # --------------------------------------------------------
+    # If target has at least 16 bytes
+    # --------------------------------------------------------
+
+    if length >= 16:
+
+        raw_altitude = decode_int(
+            data[12:16],
+            PAYLOAD_BYTEORDER
         )
+
+        target["Altitude"] = (
+            raw_altitude / 1000.0
+        )
+
+    # --------------------------------------------------------
+    # Generic bitfield
+    # --------------------------------------------------------
+
+    if length >= 17:
+
+        bitfield = data[16]
+
+        target["Bitfield"] = bitfield
+
+        for bit in range(8):
+
+            target[
+                f"Bit{bit}"
+            ] = (
+                (bitfield >> bit) & 1
+            )
+
+    # --------------------------------------------------------
+    # Generic enum
+    # --------------------------------------------------------
+
+    if length >= 18:
+
+        target["Enum"] = data[17]
+
+    # --------------------------------------------------------
+    # Remaining target parameters
+    # --------------------------------------------------------
+
+    if length > 18:
+
+        remaining = data[18:]
+
+        full_words = len(remaining) // 4
+
+        for index in range(full_words):
+
+            start = index * 4
+
+            end = start + 4
+
+            target[
+                f"Parameter_{index + 1}"
+            ] = decode_uint(
+                remaining[start:end],
+                PAYLOAD_BYTEORDER
+            )
+
+        remainder_start = full_words * 4
+
+        if remainder_start < len(remaining):
+
+            target[
+                f"Parameter_{full_words + 1}"
+            ] = decode_uint(
+                remaining[remainder_start:],
+                PAYLOAD_BYTEORDER
+            )
+
+    return target
 
 
 # ============================================================
-# PCAPNG OPTION PARSER
+# SPLIT APPLICATION PAYLOAD INTO 130-BYTE MESSAGES
 # ============================================================
 
-def parse_options(data, endian):
+def split_messages(payload):
+    """
+    Splits application payload into 130-byte messages.
 
-    options = {}
+    If payload contains:
 
-    pos = 0
+        130 bytes  -> 1 message
+        260 bytes  -> 2 messages
+        390 bytes  -> 3 messages
+        ...
 
-    while pos + 4 <= len(data):
+    Any incomplete trailing bytes are ignored.
+    """
 
-        try:
+    messages = []
 
-            code = struct.unpack_from(
-                endian + "H",
-                data,
-                pos
-            )[0]
+    if not payload:
+        return messages
 
-            length = struct.unpack_from(
-                endian + "H",
-                data,
-                pos + 2
-            )[0]
+    position = 0
 
-        except Exception:
+    while position + MESSAGE_SIZE <= len(payload):
 
-            break
-
-        pos += 4
-
-        if code == 0:
-            break
-
-        if pos + length > len(data):
-            break
-
-        value = data[
-            pos:pos + length
+        message = payload[
+            position:
+            position + MESSAGE_SIZE
         ]
 
-        options[code] = value
+        messages.append(message)
 
-        padded_length = (
-            (length + 3) // 4
-        ) * 4
+        position += MESSAGE_SIZE
 
-        pos += padded_length
+    return messages
 
-    return options
+
+# ============================================================
+# CSV COLUMN NAME
+# ============================================================
+
+def target_column(parameter_name, target_number):
+    """
+    Creates:
+
+        Parameter[1]
+        Parameter[2]
+        Parameter[3]
+
+    Only for target parameters.
+    """
+
+    return f"{parameter_name}[{target_number}]"
 
 
 # ============================================================
 # PCAPNG CONVERTER
 # ============================================================
 
-def parse_pcapng(filename):
+def convert_pcapng(input_file, output_file):
 
-    packets = []
+    print()
+    print("Reading PCAPNG file...")
+    print()
 
-    interfaces = {}
-
-    with open(filename, "rb") as f:
-
+    with open(input_file, "rb") as f:
         data = f.read()
 
+    print(
+        "PCAPNG size:",
+        len(data),
+        "bytes"
+    )
 
-    pos = 0
+    position = 0
 
-    endian = "<"
+    endian = "little"
 
-    section_number = 0
+    packet_number = 0
 
+    rows = []
 
-    while pos + 12 <= len(data):
+    all_columns = set()
 
-        try:
+    max_targets = 0
 
-            # ------------------------------------------------
-            # Block type
-            # ------------------------------------------------
+    # --------------------------------------------------------
+    # Process one network packet
+    # --------------------------------------------------------
 
-            block_type = struct.unpack_from(
-                endian + "I",
-                data,
-                pos
-            )[0]
+    def process_packet(packet):
 
+        nonlocal packet_number
+        nonlocal max_targets
 
-            # ------------------------------------------------
-            # Section Header Block
-            # ------------------------------------------------
+        application_payload = (
+            extract_application_payload(packet)
+        )
 
-            if (
-                block_type
-                == 0x0A0D0D0A
-            ):
+        if not application_payload:
+            return
 
-                if pos + 12 > len(data):
+        messages = split_messages(
+            application_payload
+        )
 
-                    log_error(
-                        f"Truncated Section Header at {pos}"
-                    )
+        # If application payload is smaller than 130,
+        # try treating the complete payload as one message.
+        if not messages:
 
-                    break
+            if len(application_payload) >= 2:
 
-
-                magic = data[
-                    pos + 8:
-                    pos + 12
+                messages = [
+                    application_payload
                 ]
 
+            else:
 
-                if magic == b"\x4D\x3C\x2B\x1A":
+                return
 
-                    endian = "<"
+        for message in messages:
 
-                elif magic == b"\x1A\x2B\x3C\x4D":
+            decoded = decode_single_message(
+                message
+            )
 
-                    endian = ">"
+            packet_number += 1
 
-                else:
+            row = {
+                "Packet_No": packet_number,
+                "Opcode": decoded["Opcode"],
+                "Target_Count": decoded["Target_Count"]
+            }
 
-                    log_error(
-                        f"Invalid byte-order magic at {pos}"
+            # ------------------------------------------------
+            # Non-target parameters
+            # ------------------------------------------------
+
+            for name, value in decoded[
+                "Parameters"
+            ].items():
+
+                row[name] = value
+
+                all_columns.add(name)
+
+            # ------------------------------------------------
+            # Target parameters
+            # ------------------------------------------------
+
+            targets = decoded["Targets"]
+
+            if len(targets) > max_targets:
+
+                max_targets = len(targets)
+
+            for target_index, target in enumerate(
+                targets,
+                start=1
+            ):
+
+                for name, value in target.items():
+
+                    column = target_column(
+                        name,
+                        target_index
                     )
 
-                    # Try little endian and continue
-                    endian = "<"
+                    row[column] = value
 
+                    all_columns.add(column)
 
-                block_length = struct.unpack_from(
-                    endian + "I",
-                    data,
-                    pos + 4
-                )[0]
+            rows.append(row)
 
+    # ========================================================
+    # PCAPNG BLOCK LOOP
+    # ========================================================
 
-                if (
-                    block_length < 28
-                    or
-                    pos + block_length > len(data)
-                ):
+    while position + 12 <= len(data):
 
-                    log_error(
-                        f"Invalid Section Header "
-                        f"length at {pos}"
-                    )
+        # ----------------------------------------------------
+        # Block type
+        # ----------------------------------------------------
 
-                    break
+        raw_block_type = data[
+            position:
+            position + 4
+        ]
 
+        # Section Header Block has special byte pattern.
+        if raw_block_type == b"\x0A\x0D\x0D\x0A":
 
-                section_number += 1
+            if position + 12 > len(data):
+                break
 
-                interfaces = {}
+            byte_order_magic = data[
+                position + 8:
+                position + 12
+            ]
 
-                pos += block_length
+            if byte_order_magic == b"\x1A\x2B\x3C\x4D":
+
+                endian = "big"
+
+            elif byte_order_magic == b"\x4D\x3C\x2B\x1A":
+
+                endian = "little"
+
+            else:
+
+                print(
+                    "WARNING: Invalid PCAPNG byte-order magic."
+                )
+
+                position += 4
 
                 continue
 
-
-            # ------------------------------------------------
-            # Read block length
-            # ------------------------------------------------
-
-            block_length = struct.unpack_from(
-                endian + "I",
+            block_length = read_u32(
                 data,
-                pos + 4
-            )[0]
-
-
-            if block_length < 12:
-
-                log_error(
-                    f"Invalid block length at {pos}"
-                )
-
-                break
-
-
-            if (
-                pos + block_length
-                > len(data)
-            ):
-
-                log_error(
-                    f"Truncated block at {pos}"
-                )
-
-                break
-
-
-            block = data[
-                pos:
-                pos + block_length
-            ]
-
-
-            # =================================================
-            # Interface Description Block
-            # =================================================
-
-            if block_type == 0x00000001:
-
-                if len(block) >= 20:
-
-                    interface_id = len(
-                        interfaces
-                    )
-
-                    link_type = struct.unpack_from(
-                        endian + "H",
-                        block,
-                        8
-                    )[0]
-
-                    snaplen = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        12
-                    )[0]
-
-
-                    # Parse options
-                    options = {}
-
-                    if len(block) > 16:
-
-                        options = parse_options(
-                            block[16:-4],
-                            endian
-                        )
-
-
-                    # Default PCAPNG timestamp
-                    # resolution is 10^-6 seconds.
-                    timestamp_resolution = 1e-6
-
-
-                    # if_tsresol option = 9
-                    if 9 in options:
-
-                        value = options[9]
-
-                        if len(value) >= 1:
-
-                            raw = value[0]
-
-                            if raw & 0x80:
-
-                                # Base 2
-                                timestamp_resolution = (
-                                    2 ** -(raw & 0x7F)
-                                )
-
-                            else:
-
-                                # Base 10
-                                timestamp_resolution = (
-                                    10 ** (-raw)
-                                )
-
-
-                    interfaces[
-                        interface_id
-                    ] = {
-                        "link_type": link_type,
-                        "snaplen": snaplen,
-                        "timestamp_resolution":
-                            timestamp_resolution
-                    }
-
-
-            # =================================================
-            # Enhanced Packet Block
-            # =================================================
-
-            elif block_type == 0x00000006:
-
-                if len(block) < 32:
-
-                    log_error(
-                        f"Malformed Enhanced Packet "
-                        f"Block at {pos}"
-                    )
-
-                    # Do NOT drop packet structure silently
-
-                else:
-
-                    interface_id = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        8
-                    )[0]
-
-                    timestamp_high = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        12
-                    )[0]
-
-                    timestamp_low = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        16
-                    )[0]
-
-                    captured_length = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        20
-                    )[0]
-
-                    original_length = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        24
-                    )[0]
-
-
-                    packet_start = 28
-
-                    packet_end = (
-                        packet_start
-                        + captured_length
-                    )
-
-
-                    if (
-                        packet_start <= len(block)
-                        and
-                        packet_end <= len(block) - 4
-                    ):
-
-                        packet = block[
-                            packet_start:
-                            packet_end
-                        ]
-
-                        timestamp_raw = (
-                            (timestamp_high << 32)
-                            |
-                            timestamp_low
-                        )
-
-                        interface = interfaces.get(
-                            interface_id,
-                            {}
-                        )
-
-                        resolution = interface.get(
-                            "timestamp_resolution",
-                            1e-6
-                        )
-
-                        timestamp = (
-                            timestamp_to_string(
-                                timestamp_raw,
-                                resolution
-                            )
-                        )
-
-                        packets.append({
-                            "timestamp":
-                                timestamp,
-                            "timestamp_raw":
-                                timestamp_raw,
-                            "interface_id":
-                                interface_id,
-                            "captured_length":
-                                captured_length,
-                            "original_length":
-                                original_length,
-                            "packet":
-                                packet
-                        })
-
-                    else:
-
-                        log_error(
-                            f"Invalid packet boundaries "
-                            f"at block {pos}"
-                        )
-
-
-            # =================================================
-            # Simple Packet Block
-            # =================================================
-
-            elif block_type == 0x00000003:
-
-                if len(block) >= 16:
-
-                    original_length = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        8
-                    )[0]
-
-                    packet = block[
-                        12:-4
-                    ]
-
-                    packets.append({
-                        "timestamp": "",
-                        "timestamp_raw": 0,
-                        "interface_id": 0,
-                        "captured_length":
-                            len(packet),
-                        "original_length":
-                            original_length,
-                        "packet":
-                            packet
-                    })
-
-
-            # =================================================
-            # Legacy Packet Block
-            # =================================================
-
-            elif block_type == 0x00000002:
-
-                if len(block) >= 32:
-
-                    interface_id = struct.unpack_from(
-                        endian + "H",
-                        block,
-                        8
-                    )[0]
-
-                    timestamp_high = struct.unpack_from(
-                        endian + "H",
-                        block,
-                        12
-                    )[0]
-
-                    timestamp_low = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        16
-                    )[0]
-
-                    captured_length = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        20
-                    )[0]
-
-                    original_length = struct.unpack_from(
-                        endian + "I",
-                        block,
-                        24
-                    )[0]
-
-                    packet_start = 28
-
-                    packet_end = (
-                        packet_start
-                        + captured_length
-                    )
-
-                    if (
-                        packet_end <= len(block) - 4
-                    ):
-
-                        packet = block[
-                            packet_start:
-                            packet_end
-                        ]
-
-                        timestamp_raw = (
-                            (timestamp_high << 32)
-                            |
-                            timestamp_low
-                        )
-
-                        interface = interfaces.get(
-                            interface_id,
-                            {}
-                        )
-
-                        resolution = interface.get(
-                            "timestamp_resolution",
-                            1e-6
-                        )
-
-                        timestamp = (
-                            timestamp_to_string(
-                                timestamp_raw,
-                                resolution
-                            )
-                        )
-
-                        packets.append({
-                            "timestamp":
-                                timestamp,
-                            "timestamp_raw":
-                                timestamp_raw,
-                            "interface_id":
-                                interface_id,
-                            "captured_length":
-                                captured_length,
-                            "original_length":
-                                original_length,
-                            "packet":
-                                packet
-                        })
-
-
-            # Move to next block
-            pos += block_length
-
-
-        except Exception as e:
-
-            log_error(
-                f"PCAPNG parsing error at offset "
-                f"{pos}: {e}"
+                position + 4,
+                endian
             )
 
-            # Attempt to move forward instead of crashing.
-            pos += 4
+            if block_length < 28:
+                print(
+                    "WARNING: Invalid Section Header Block."
+                )
+                break
 
+            if (
+                position + block_length
+                > len(data)
+            ):
+                print(
+                    "WARNING: Truncated Section Header Block."
+                )
+                break
 
-    return packets
+            position += block_length
 
+            continue
 
-# ============================================================
-# COLLECT ALL CSV COLUMNS
-# ============================================================
-
-def collect_columns(rows):
-
-    columns = [
-        "packet_number",
-        "capture_timestamp",
-        "opcode",
-        "opcode_name",
-        "target_index"
-    ]
-
-    for row in rows:
-
-        for key in row.keys():
-
-            if key not in columns:
-
-                columns.append(key)
-
-    return columns
-
-
-# ============================================================
-# WRITE CSV
-# ============================================================
-
-def write_csv(filename, rows, columns):
-
-    with open(
-        filename,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=columns,
-            extrasaction="ignore"
-        )
-
-        writer.writeheader()
-
-        for row in rows:
-
-            writer.writerow(row)
-
-
-# ============================================================
-# MAIN CONVERSION
-# ============================================================
-
-def convert(filename):
-
-    # Clear old error file
-    with open(
-        ERROR_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        f.write("PCAPNG conversion errors\n")
-        f.write("=" * 60 + "\n")
-
-
-    print()
-    print("=" * 60)
-    print("PURE PYTHON SDR PCAPNG -> CSV")
-    print("=" * 60)
-
-    print()
-    print("Reading:")
-    print(filename)
-
-    packets = parse_pcapng(
-        filename
-    )
-
-    print()
-    print(
-        "PCAPNG packets found:",
-        len(packets)
-    )
-
-
-    all_rows = []
-
-    opcode_rows = defaultdict(list)
-
-    opcode_set = set()
-
-
-    # ========================================================
-    # Process every packet
-    # ========================================================
-
-    for packet_number, item in enumerate(
-        packets,
-        1
-    ):
+        # ----------------------------------------------------
+        # Normal block
+        # ----------------------------------------------------
 
         try:
 
-            raw_packet = item[
-                "packet"
-            ]
-
-
-            # ------------------------------------------------
-            # Extract network/application payload
-            # ------------------------------------------------
-
-            network = extract_sdr_payload(
-                raw_packet
+            block_type = read_u32(
+                data,
+                position,
+                endian
             )
 
-            payload = network[
-                "payload"
-            ]
-
-
-            # ------------------------------------------------
-            # Decode opcode
-            # ------------------------------------------------
-
-            opcode, opcode_name, decoded_targets = (
-                decode_sdr(payload)
+            block_length = read_u32(
+                data,
+                position + 4,
+                endian
             )
 
+        except ValueError:
 
-            if opcode is not None:
+            break
 
-                opcode_set.add(
-                    opcode
-                )
+        if block_length < 12:
 
-
-            # ------------------------------------------------
-            # If decoder somehow returns no rows,
-            # preserve the packet.
-            # ------------------------------------------------
-
-            if not decoded_targets:
-
-                decoded_targets = [
-                    {}
-                ]
-
-
-            # =================================================
-            # ONE TARGET = ONE CSV ROW
-            # =================================================
-
-            for target_index, decoded in enumerate(
-                decoded_targets,
-                1
-            ):
-
-                row = {
-
-                    "packet_number":
-                        packet_number,
-
-                    "capture_timestamp":
-                        item.get(
-                            "timestamp",
-                            ""
-                        ),
-
-                    "opcode":
-                        opcode
-                        if opcode is not None
-                        else "",
-
-                    "opcode_name":
-                        opcode_name,
-
-                    "target_index":
-                        target_index
-                }
-
-
-                # --------------------------------------------
-                # Add ONLY decoded SDR parameters
-                # --------------------------------------------
-
-                for key, value in decoded.items():
-
-                    row[key] = value
-
-
-                # --------------------------------------------
-                # Combined CSV
-                # --------------------------------------------
-
-                all_rows.append(
-                    row
-                )
-
-
-                # --------------------------------------------
-                # Per-opcode CSV
-                # --------------------------------------------
-
-                opcode_key = (
-                    opcode
-                    if opcode is not None
-                    else "unknown"
-                )
-
-                opcode_rows[
-                    opcode_key
-                ].append(row)
-
-
-        except Exception as e:
-
-            # ------------------------------------------------
-            # NEVER crash the whole conversion because of
-            # one packet.
-            # ------------------------------------------------
-
-            log_error(
-                f"Packet {packet_number}: {e}"
+            print(
+                "WARNING: Invalid block length:",
+                block_length
             )
 
-            # Preserve packet as a CSV row.
-            all_rows.append({
-                "packet_number":
-                    packet_number,
+            break
 
-                "capture_timestamp":
-                    item.get(
-                        "timestamp",
-                        ""
-                    ),
+        if (
+            position + block_length
+            > len(data)
+        ):
 
-                "opcode": "",
+            print(
+                "WARNING: Truncated PCAPNG block."
+            )
 
-                "opcode_name":
-                    "DECODE_ERROR",
+            break
 
-                "target_index": 1
-            })
-
-
-    # ========================================================
-    # Combined CSV
-    # ========================================================
-
-    if all_rows:
-
-        combined_columns = collect_columns(
-            all_rows
-        )
-
-        output_dir = os.path.dirname(
-            os.path.abspath(filename)
-        )
-
-        combined_file = os.path.join(
-            output_dir,
-            "telemetry_combined.csv"
-        )
-
-        write_csv(
-            combined_file,
-            all_rows,
-            combined_columns
-        )
-
-    else:
-
-        combined_file = ""
-
-
-    # ========================================================
-    # Per opcode CSV
-    # ========================================================
-
-    output_dir = os.path.dirname(
-        os.path.abspath(filename)
-    )
-
-
-    per_opcode_counts = {}
-
-
-    for opcode, rows in opcode_rows.items():
+        block = data[
+            position:
+            position + block_length
+        ]
 
         # ----------------------------------------------------
-        # Sort by capture timestamp
+        # Interface Description Block
+        #
+        # Type = 1
         # ----------------------------------------------------
 
-        rows.sort(
-            key=lambda x:
-            x.get(
-                "capture_timestamp",
-                ""
-            )
-        )
+        if block_type == 0x00000001:
 
+            pass
 
-        if opcode == "unknown":
+        # ----------------------------------------------------
+        # Legacy Packet Block
+        #
+        # Type = 2
+        # ----------------------------------------------------
 
-            filename_opcode = "opcode_unknown.csv"
+        elif block_type == 0x00000002:
+
+            if len(block) >= 28:
+
+                try:
+
+                    captured_length = read_u32(
+                        block,
+                        20,
+                        endian
+                    )
+
+                    packet_start = 28
+
+                    packet_end = (
+                        packet_start
+                        + captured_length
+                    )
+
+                    # Last 4 bytes = block total
+                    # length, so packet must finish
+                    # before them.
+
+                    if (
+                        packet_end
+                        <= len(block) - 4
+                    ):
+
+                        packet = block[
+                            packet_start:
+                            packet_end
+                        ]
+
+                        process_packet(packet)
+
+                except Exception as e:
+
+                    print(
+                        "WARNING: Error in legacy packet:",
+                        e
+                    )
+
+        # ----------------------------------------------------
+        # Enhanced Packet Block
+        #
+        # Type = 6
+        # ----------------------------------------------------
+
+        elif block_type == 0x00000006:
+
+            if len(block) >= 32:
+
+                try:
+
+                    captured_length = read_u32(
+                        block,
+                        20,
+                        endian
+                    )
+
+                    packet_start = 28
+
+                    packet_end = (
+                        packet_start
+                        + captured_length
+                    )
+
+                    if (
+                        packet_end
+                        <= len(block) - 4
+                    ):
+
+                        packet = block[
+                            packet_start:
+                            packet_end
+                        ]
+
+                        process_packet(packet)
+
+                except Exception as e:
+
+                    print(
+                        "WARNING: Error in enhanced packet:",
+                        e
+                    )
+
+        position += block_length
+
+    # ========================================================
+    # CREATE CSV HEADER
+    # ========================================================
+
+    base_columns = [
+        "Packet_No",
+        "Opcode",
+        "Target_Count"
+    ]
+
+    # Separate normal columns and target columns.
+    normal_columns = []
+
+    target_columns = []
+
+    for column in all_columns:
+
+        if "[" in column and column.endswith("]"):
+
+            target_columns.append(column)
 
         else:
 
-            filename_opcode = (
-                f"opcode_{opcode}.csv"
+            normal_columns.append(column)
+
+    # Sort normal parameter columns.
+    normal_columns.sort()
+
+    # --------------------------------------------------------
+    # Sort target columns naturally:
+    #
+    # GlobalID[1]
+    # Latitude[1]
+    # ...
+    # GlobalID[2]
+    # Latitude[2]
+    # ...
+    # --------------------------------------------------------
+
+    import re
+
+    def target_sort_key(column):
+
+        match = re.match(
+            r"^(.*)\[(\d+)\]$",
+            column
+        )
+
+        if not match:
+            return (
+                999999,
+                column
             )
 
+        name = match.group(1)
 
-        output_file = os.path.join(
-            output_dir,
-            filename_opcode
+        number = int(
+            match.group(2)
         )
 
+        return (
+            number,
+            name
+        )
 
-        # ----------------------------------------------------
-        # Determine columns.
-        #
-        # Keep only parameters relevant to this opcode.
-        # ----------------------------------------------------
+    target_columns.sort(
+        key=target_sort_key
+    )
 
-        columns = [
-            "packet_number",
-            "capture_timestamp",
-            "opcode",
-            "opcode_name",
-            "target_index"
-        ]
+    full_header = (
+        base_columns
+        + normal_columns
+        + target_columns
+    )
 
+    # ========================================================
+    # WRITE CSV
+    # ========================================================
 
-        for row in rows:
+    try:
 
-            for key in row.keys():
-
-                if key not in columns:
-
-                    columns.append(key)
-
-
-        write_csv(
+        with open(
             output_file,
-            rows,
-            columns
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=full_header,
+                extrasaction="ignore"
+            )
+
+            writer.writeheader()
+
+            for row in rows:
+
+                writer.writerow(row)
+
+    except PermissionError:
+
+        base, extension = os.path.splitext(
+            output_file
         )
 
+        fallback = (
+            base
+            + "_"
+            + datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+            + extension
+        )
 
-        per_opcode_counts[
-            opcode
-        ] = len(rows)
+        print()
+        print(
+            "WARNING: CSV is locked."
+        )
 
+        print(
+            "Writing to:",
+            fallback
+        )
+
+        with open(
+            fallback,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=full_header,
+                extrasaction="ignore"
+            )
+
+            writer.writeheader()
+
+            for row in rows:
+
+                writer.writerow(row)
+
+        output_file = fallback
 
     # ========================================================
-    # SUMMARY
+    # RESULT
     # ========================================================
 
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("CONVERSION COMPLETED")
-    print("=" * 60)
+    print("=" * 70)
 
     print(
-        "Total packets processed:",
-        len(packets)
+        "Packets/messages decoded:",
+        packet_number
     )
 
     print(
-        "Total CSV rows:",
-        len(all_rows)
+        "Maximum targets:",
+        max_targets
     )
 
     print(
-        "Total different opcodes:",
-        len(opcode_set)
+        "CSV columns:",
+        len(full_header)
+    )
+
+    print(
+        "CSV file:",
+        output_file
+    )
+
+    print("=" * 70)
+
+    return packet_number, output_file
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print("PCAPNG TO CSV CONVERTER")
+    print("=" * 70)
+    print()
+    print("Message size :", MESSAGE_SIZE)
+    print("Header size  :", HEADER_SIZE)
+    print()
+
+    # --------------------------------------------------------
+    # PCAPNG input
+    # --------------------------------------------------------
+
+    pcapng_file = input(
+        "Enter the full path of your PCAPNG file: "
+    ).strip().strip('"')
+
+    if not os.path.isfile(pcapng_file):
+
+        print()
+        print(
+            "ERROR: PCAPNG file not found:"
+        )
+
+        print(pcapng_file)
+
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Output filename
+    # --------------------------------------------------------
+
+    default_csv = (
+        os.path.splitext(
+            pcapng_file
+        )[0]
+        + ".csv"
     )
 
     print()
 
-    print("Rows written per opcode:")
+    csv_input = input(
+        f"CSV output path [{default_csv}]: "
+    ).strip().strip('"')
 
-    for opcode in sorted(
-        per_opcode_counts,
-        key=lambda x: str(x)
-    ):
+    if csv_input:
+
+        csv_file = csv_input
+
+    else:
+
+        csv_file = default_csv
+
+    print()
+    print("Starting conversion...")
+    print()
+
+    try:
+
+        convert_pcapng(
+            pcapng_file,
+            csv_file
+        )
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Conversion cancelled."
+        )
+
+    except Exception as e:
+
+        print()
+        print("=" * 70)
+        print("ERROR")
+        print("=" * 70)
 
         print(
-            f"  Opcode {opcode}: "
-            f"{per_opcode_counts[opcode]} rows"
+            type(e).__name__,
+            ":",
+            str(e)
         )
 
-    print()
+        import traceback
 
-    if combined_file:
+        traceback.print_exc()
 
-        print(
-            "Combined CSV:",
-            combined_file
-        )
+        print("=" * 70)
 
-    print(
-        "Error log:",
-        os.path.abspath(
-            ERROR_FILE
-        )
+    input(
+        "\nPress Enter to exit..."
     )
-
-    print()
 
 
 # ============================================================
 # PROGRAM START
 # ============================================================
 
-def main():
-
-    # --------------------------------------------------------
-    # Usage:
-    #
-    # python3 script.py capture.pcapng
-    #
-    # --------------------------------------------------------
-
-    if len(sys.argv) >= 2:
-
-        filename = sys.argv[1]
-
-    else:
-
-        filename = input(
-            "Enter PCAPNG file path: "
-        ).strip().strip('"')
-
-
-    if not filename:
-
-        print(
-            "ERROR: No PCAPNG file specified."
-        )
-
-        return
-
-
-    if not os.path.isfile(filename):
-
-        print(
-            "ERROR: File not found:"
-        )
-
-        print(filename)
-
-        return
-
-
-    if not filename.lower().endswith(
-        ".pcapng"
-    ):
-
-        print(
-            "WARNING: File does not have "
-            "a .pcapng extension."
-        )
-
-
-    try:
-
-        convert(filename)
-
-    except Exception as e:
-
-        log_error(
-            f"Fatal error: {e}"
-        )
-
-        print()
-        print(
-            "ERROR:",
-            e
-        )
-
-        print(
-            "See errors.log for details."
-        )
-
-
 if __name__ == "__main__":
-
     main()
