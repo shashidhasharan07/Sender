@@ -1,1331 +1,2437 @@
-import struct
 import csv
 import os
-from datetime import datetime, timezone
+import struct
+from datetime import datetime
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Your protocol is assumed to use big-endian payload values.
-PAYLOAD_BYTEORDER = "big"
-
-# One complete target message
-MESSAGE_SIZE = 130
-
-# Header inside one message
-HEADER_SIZE = 28
-
-# First byte of the application message is assumed to be Opcode
-OPCODE_OFFSET = 0
-
-# Number of targets is assumed to be the second byte.
-TARGET_COUNT_OFFSET = 1
-
 # ------------------------------------------------------------
-# Current generic target layout
-#
-# IMPORTANT:
-# The uploaded file does NOT contain the actual protocol
-# definition for the 28-byte header / 102-byte parameter area.
-#
-# Therefore these are only safe generic fields.
+# YOUR CUSTOM HEADER
 # ------------------------------------------------------------
 
-GENERIC_TARGET_FIELDS = [
-    "GlobalID",
-    "Latitude",
-    "Longitude",
-    "Altitude",
-    "Bitfield",
-    "Enum"
-]
+HEADER_SIZE = 16
+
+# 10th byte of custom header
+#
+# Byte 1  -> index 0
+# Byte 10 -> index 9
+#
+OPCODE_OFFSET = 9
 
 
 # ============================================================
-# BYTE ORDER HELPERS
+# SIZE FIELD IN YOUR 16-BYTE HEADER
+# ============================================================
+#
+# Current assumption:
+#
+# Byte 1  - 4  : Other header data
+# Byte 5  - 8  : Other header data
+# Byte 9       : Other header data
+# Byte 10      : OPCODE
+# Byte 11 - 12 : Other header data
+# Byte 13 - 16 : PACKET SIZE
+#
+# Therefore:
+#
+# SIZE_OFFSET = 12
+# SIZE_LENGTH = 4
+#
+# Change these according to your actual header.
 # ============================================================
 
-def normalize_byteorder(byteorder):
-    """
-    Converts Python/struct style endian values into
-    'big' or 'little'.
-    """
+SIZE_OFFSET = 12
+SIZE_LENGTH = 4
 
-    if byteorder in ("big", ">","!"):
-        return "big"
+# "big"    -> most significant byte first
+# "little" -> least significant byte first
 
-    if byteorder in ("little", "<"):
-        return "little"
+SIZE_ENDIAN = "big"
+
+
+# ------------------------------------------------------------
+# If True:
+#
+#     packet_size = header + payload
+#
+# payload_size = packet_size - 16
+#
+# If False:
+#
+#     packet_size = payload size
+# ------------------------------------------------------------
+
+SIZE_INCLUDES_HEADER = True
+
+
+# ============================================================
+# ICD DEFINITIONS
+# ============================================================
+#
+# The decoder supports:
+#
+# Primitive:
+#   uint8
+#   int8
+#   uint16
+#   int16
+#   uint32
+#   int32
+#   uint64
+#   int64
+#   float32
+#   float64
+#   bytes
+#
+# Containers:
+#   struct
+#   array
+#   dynamic_array
+#   mixed
+#
+# Arrays can contain:
+#
+#   primitive
+#   struct
+#   array
+#   mixed
+#
+# Structs can contain:
+#
+#   primitive
+#   struct
+#   array
+#   mixed
+#
+# Therefore arbitrary nesting is supported.
+#
+# ============================================================
+
+
+ICDS = {
+
+    # ========================================================
+    # OPCODE 104
+    #
+    # Simple structure
+    # ========================================================
+
+    104: {
+        "type": "struct",
+
+        "fields": [
+
+            {
+                "name": "target_id",
+                "type": "uint8"
+            },
+
+            {
+                "name": "latitude",
+                "type": "int32",
+                "scale": 0.000001
+            },
+
+            {
+                "name": "longitude",
+                "type": "int32",
+                "scale": 0.000001
+            }
+        ]
+    },
+
+
+    # ========================================================
+    # OPCODE 105
+    #
+    # Example:
+    #
+    # struct
+    # |
+    # +-- num_targets
+    # |
+    # +-- Target[num_targets]
+    #       |
+    #       +-- id
+    #       +-- range
+    #       +-- num_tracks
+    #       |
+    #       +-- Track[num_tracks]
+    #               |
+    #               +-- velocity
+    #               +-- status
+    #
+    # ========================================================
+
+    105: {
+        "type": "struct",
+
+        "fields": [
+
+            # ------------------------------------------------
+            # Number of targets
+            # ------------------------------------------------
+
+            {
+                "name": "num_targets",
+                "type": "uint8"
+            },
+
+            # ------------------------------------------------
+            # Target array
+            # ------------------------------------------------
+
+            {
+                "name": "Target",
+                "type": "array",
+
+                "count_from": "num_targets",
+                "max_count": 5,
+
+                "element": {
+
+                    "type": "struct",
+
+                    "fields": [
+
+                        # ------------------------------------
+                        # Target ID
+                        # ------------------------------------
+
+                        {
+                            "name": "id",
+                            "type": "uint8"
+                        },
+
+                        # ------------------------------------
+                        # Range
+                        # ------------------------------------
+
+                        {
+                            "name": "range",
+                            "type": "uint16",
+                            "scale": 0.5
+                        },
+
+                        # ------------------------------------
+                        # Number of tracks
+                        # ------------------------------------
+
+                        {
+                            "name": "num_tracks",
+                            "type": "uint8"
+                        },
+
+                        # ------------------------------------
+                        # Track array
+                        # ------------------------------------
+
+                        {
+                            "name": "Track",
+                            "type": "array",
+
+                            "count_from": "num_tracks",
+                            "max_count": 3,
+
+                            "element": {
+
+                                "type": "struct",
+
+                                "fields": [
+
+                                    {
+                                        "name": "velocity",
+                                        "type": "float32"
+                                    },
+
+                                    {
+                                        "name": "status",
+                                        "type": "uint8",
+
+                                        "enum": {
+                                            0: "FREE",
+                                            1: "LOCKED"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+
+
+    # ========================================================
+    # OPCODE 106
+    #
+    # STRUCT -> STRUCT
+    # ========================================================
+
+    106: {
+        "type": "struct",
+
+        "fields": [
+
+            {
+                "name": "message_id",
+                "type": "uint8"
+            },
+
+            {
+                "name": "position",
+                "type": "struct",
+
+                "fields": [
+
+                    {
+                        "name": "latitude",
+                        "type": "int32",
+                        "scale": 0.000001
+                    },
+
+                    {
+                        "name": "longitude",
+                        "type": "int32",
+                        "scale": 0.000001
+                    }
+                ]
+            }
+        ]
+    },
+
+
+    # ========================================================
+    # OPCODE 107
+    #
+    # ARRAY -> STRUCT
+    # ========================================================
+
+    107: {
+        "type": "array",
+
+        "name": "Target",
+
+        "count": 3,
+
+        "element": {
+
+            "type": "struct",
+
+            "fields": [
+
+                {
+                    "name": "id",
+                    "type": "uint8"
+                },
+
+                {
+                    "name": "value",
+                    "type": "uint16"
+                }
+            ]
+        }
+    },
+
+
+    # ========================================================
+    # OPCODE 108
+    #
+    # ARRAY -> ARRAY -> STRUCT
+    # ========================================================
+
+    108: {
+        "type": "array",
+
+        "name": "Group",
+
+        "count": 2,
+
+        "element": {
+
+            "type": "array",
+
+            "name": "Target",
+
+            "count": 3,
+
+            "element": {
+
+                "type": "struct",
+
+                "fields": [
+
+                    {
+                        "name": "id",
+                        "type": "uint8"
+                    },
+
+                    {
+                        "name": "value",
+                        "type": "float32"
+                    }
+                ]
+            }
+        }
+    },
+
+
+    # ========================================================
+    # OPCODE 109
+    #
+    # MIXED
+    #
+    # STRUCT -> ARRAY -> STRUCT
+    # ========================================================
+
+    109: {
+        "type": "mixed",
+
+        "blocks": [
+
+            {
+                "type": "struct",
+
+                "fields": [
+
+                    {
+                        "name": "message_id",
+                        "type": "uint8"
+                    },
+
+                    {
+                        "name": "count",
+                        "type": "uint8"
+                    }
+                ]
+            },
+
+            {
+                "name": "values",
+
+                "type": "array",
+
+                "count_from": "count",
+                "max_count": 5,
+
+                "element": {
+
+                    "type": "struct",
+
+                    "fields": [
+
+                        {
+                            "name": "id",
+                            "type": "uint8"
+                        },
+
+                        {
+                            "name": "value",
+                            "type": "uint16"
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+
+
+    # ========================================================
+    # OPCODE 120
+    #
+    # Simple example
+    # ========================================================
+
+    120: {
+        "type": "struct",
+
+        "fields": [
+
+            {
+                "name": "message_id",
+                "type": "uint8"
+            },
+
+            {
+                "name": "status",
+                "type": "uint32"
+            },
+
+            {
+                "name": "health",
+                "type": "uint8"
+            }
+        ]
+    }
+}
+
+
+# ============================================================
+# DATA TYPES
+# ============================================================
+
+TYPE_INFO = {
+
+    "uint8":  (1, "B"),
+    "int8":   (1, "b"),
+
+    "uint16": (2, "H"),
+    "int16":  (2, "h"),
+
+    "uint32": (4, "I"),
+    "int32":  (4, "i"),
+
+    "uint64": (8, "Q"),
+    "int64":  (8, "q"),
+
+    "float32": (4, "f"),
+    "float64": (8, "d")
+}
+
+
+# ============================================================
+# READ INTEGER
+# ============================================================
+
+def read_integer(
+    data,
+    offset,
+    length,
+    endian
+):
+
+    if offset + length > len(data):
+
+        raise ValueError(
+            "Integer extends beyond available data"
+        )
+
+    return int.from_bytes(
+        data[
+            offset:
+            offset + length
+        ],
+        byteorder=endian,
+        signed=False
+    )
+
+
+# ============================================================
+# READ PCAP
+# ============================================================
+
+def read_pcap(
+    file_path
+):
+
+    packets = []
+
+    with open(
+        file_path,
+        "rb"
+    ) as file:
+
+        global_header = file.read(24)
+
+        if len(global_header) != 24:
+
+            raise ValueError(
+                "Invalid PCAP global header"
+            )
+
+        magic = global_header[
+            0:4
+        ]
+
+        # ----------------------------------------------------
+        # Determine endian and timestamp resolution
+        # ----------------------------------------------------
+
+        if magic == b"\xd4\xc3\xb2\xa1":
+
+            endian = "<"
+            timestamp_divisor = 1000000
+
+        elif magic == b"\xa1\xb2\xc3\xd4":
+
+            endian = ">"
+            timestamp_divisor = 1000000
+
+        elif magic == b"\x4d\x3c\xb2\xa1":
+
+            endian = "<"
+            timestamp_divisor = 1000000000
+
+        elif magic == b"\xa1\xb2\x3c\x4d":
+
+            endian = ">"
+            timestamp_divisor = 1000000000
+
+        else:
+
+            raise ValueError(
+                "Not a valid PCAP file"
+            )
+
+        # ----------------------------------------------------
+        # Read packet records
+        # ----------------------------------------------------
+
+        while True:
+
+            packet_header = file.read(16)
+
+            if not packet_header:
+
+                break
+
+            if len(packet_header) != 16:
+
+                raise ValueError(
+                    "Incomplete PCAP packet header"
+                )
+
+            (
+                ts_sec,
+                ts_fraction,
+                incl_len,
+                orig_len
+            ) = struct.unpack(
+                endian + "IIII",
+                packet_header
+            )
+
+            packet_data = file.read(
+                incl_len
+            )
+
+            if len(packet_data) != incl_len:
+
+                raise ValueError(
+                    "Incomplete PCAP packet data"
+                )
+
+            timestamp = (
+                ts_sec +
+                ts_fraction / timestamp_divisor
+            )
+
+            packets.append(
+                {
+                    "timestamp": timestamp,
+                    "data": packet_data
+                }
+            )
+
+    return packets
+
+
+# ============================================================
+# READ PCAPNG
+# ============================================================
+
+def read_pcapng(
+    file_path
+):
+
+    packets = []
+
+    interfaces = {}
+
+    endian = None
+
+    with open(
+        file_path,
+        "rb"
+    ) as file:
+
+        while True:
+
+            block_type_bytes = file.read(4)
+
+            if not block_type_bytes:
+
+                break
+
+            if len(block_type_bytes) != 4:
+
+                raise ValueError(
+                    "Incomplete PCAPNG block type"
+                )
+
+            # =================================================
+            # SECTION HEADER BLOCK
+            # =================================================
+
+            if block_type_bytes == b"\x0a\x0d\x0d\x0a":
+
+                block_length_bytes = file.read(4)
+
+                if len(block_length_bytes) != 4:
+
+                    raise ValueError(
+                        "Invalid PCAPNG section header"
+                    )
+
+                remaining = file.read(8)
+
+                if len(remaining) != 8:
+
+                    raise ValueError(
+                        "Incomplete PCAPNG section header"
+                    )
+
+                bom = remaining[
+                    0:4
+                ]
+
+                if bom == b"\x4d\x3c\x2b\x1a":
+
+                    endian = "<"
+
+                elif bom == b"\x1a\x2b\x3c\x4d":
+
+                    endian = ">"
+
+                else:
+
+                    raise ValueError(
+                        "Invalid PCAPNG byte-order magic"
+                    )
+
+                block_length = struct.unpack(
+                    endian + "I",
+                    block_length_bytes
+                )[0]
+
+                remaining_length = (
+                    block_length -
+                    12
+                )
+
+                if remaining_length < 0:
+
+                    raise ValueError(
+                        "Invalid PCAPNG block length"
+                    )
+
+                rest = file.read(
+                    remaining_length
+                )
+
+                if len(rest) != remaining_length:
+
+                    raise ValueError(
+                        "Incomplete PCAPNG section"
+                    )
+
+                continue
+
+            # =================================================
+            # CHECK ENDIANNESS
+            # =================================================
+
+            if endian is None:
+
+                raise ValueError(
+                    "PCAPNG section header not found"
+                )
+
+            # =================================================
+            # BLOCK LENGTH
+            # =================================================
+
+            block_length_bytes = file.read(4)
+
+            if len(block_length_bytes) != 4:
+
+                raise ValueError(
+                    "Incomplete PCAPNG block length"
+                )
+
+            block_length = struct.unpack(
+                endian + "I",
+                block_length_bytes
+            )[0]
+
+            if block_length < 12:
+
+                raise ValueError(
+                    "Invalid PCAPNG block length"
+                )
+
+            block_data = file.read(
+                block_length - 8
+            )
+
+            if len(block_data) != (
+                block_length - 8
+            ):
+
+                raise ValueError(
+                    "Incomplete PCAPNG block"
+                )
+
+            body = block_data[
+                :-4
+            ]
+
+            block_type = struct.unpack(
+                endian + "I",
+                block_type_bytes
+            )[0]
+
+            # =================================================
+            # INTERFACE DESCRIPTION BLOCK
+            # =================================================
+
+            if block_type == 0x00000001:
+
+                if len(body) < 8:
+
+                    continue
+
+                (
+                    link_type,
+                    reserved,
+                    snaplen
+                ) = struct.unpack(
+                    endian + "HHI",
+                    body[:8]
+                )
+
+                ts_resolution = 1000000
+
+                options = body[
+                    8:
+                ]
+
+                option_offset = 0
+
+                while (
+                    option_offset + 4
+                    <= len(options)
+                ):
+
+                    (
+                        option_code,
+                        option_length
+                    ) = struct.unpack_from(
+                        endian + "HH",
+                        options,
+                        option_offset
+                    )
+
+                    option_offset += 4
+
+                    if option_code == 0:
+
+                        break
+
+                    option_value = options[
+                        option_offset:
+                        option_offset +
+                        option_length
+                    ]
+
+                    # ----------------------------------------
+                    # if_tsresol
+                    # ----------------------------------------
+
+                    if option_code == 9:
+
+                        if len(
+                            option_value
+                        ) >= 1:
+
+                            value = (
+                                option_value[0]
+                            )
+
+                            if value & 0x80:
+
+                                ts_resolution = (
+                                    2 **
+                                    (value & 0x7F)
+                                )
+
+                            else:
+
+                                ts_resolution = (
+                                    10 **
+                                    value
+                                )
+
+                    padded_length = (
+                        (
+                            option_length +
+                            3
+                        ) // 4
+                    ) * 4
+
+                    option_offset += (
+                        padded_length
+                    )
+
+                interface_id = len(
+                    interfaces
+                )
+
+                interfaces[
+                    interface_id
+                ] = {
+
+                    "link_type":
+                        link_type,
+
+                    "ts_resolution":
+                        ts_resolution
+                }
+
+            # =================================================
+            # ENHANCED PACKET BLOCK
+            # =================================================
+
+            elif block_type == 0x00000006:
+
+                if len(body) < 20:
+
+                    continue
+
+                (
+                    interface_id,
+                    ts_high,
+                    ts_low,
+                    captured_length,
+                    original_length
+                ) = struct.unpack(
+                    endian + "IIIII",
+                    body[:20]
+                )
+
+                packet_start = 20
+
+                packet_end = (
+                    packet_start +
+                    captured_length
+                )
+
+                packet_data = body[
+                    packet_start:
+                    packet_end
+                ]
+
+                interface_info = interfaces.get(
+                    interface_id,
+                    {
+                        "ts_resolution":
+                            1000000
+                    }
+                )
+
+                ts_resolution = (
+                    interface_info[
+                        "ts_resolution"
+                    ]
+                )
+
+                timestamp_value = (
+                    (ts_high << 32) |
+                    ts_low
+                )
+
+                timestamp = (
+                    timestamp_value /
+                    ts_resolution
+                )
+
+                packets.append(
+                    {
+                        "timestamp":
+                            timestamp,
+
+                        "data":
+                            packet_data
+                    }
+                )
+
+            # =================================================
+            # SIMPLE PACKET BLOCK
+            # =================================================
+
+            elif block_type == 0x00000003:
+
+                if len(body) < 4:
+
+                    continue
+
+                packet_data = body[
+                    4:
+                ]
+
+                packets.append(
+                    {
+                        "timestamp":
+                            None,
+
+                        "data":
+                            packet_data
+                    }
+                )
+
+            # =================================================
+            # LEGACY PACKET BLOCK
+            # =================================================
+
+            elif block_type == 0x00000002:
+
+                if len(body) < 20:
+
+                    continue
+
+                (
+                    interface_id,
+                    drops_count,
+                    ts_high,
+                    ts_low,
+                    captured_length,
+                    original_length
+                ) = struct.unpack(
+                    endian + "HHIIII",
+                    body[:20]
+                )
+
+                packet_start = 20
+
+                packet_end = (
+                    packet_start +
+                    captured_length
+                )
+
+                packet_data = body[
+                    packet_start:
+                    packet_end
+                ]
+
+                interface_info = interfaces.get(
+                    interface_id,
+                    {
+                        "ts_resolution":
+                            1000000
+                    }
+                )
+
+                ts_resolution = (
+                    interface_info[
+                        "ts_resolution"
+                    ]
+                )
+
+                timestamp_value = (
+                    (ts_high << 32) |
+                    ts_low
+                )
+
+                timestamp = (
+                    timestamp_value /
+                    ts_resolution
+                )
+
+                packets.append(
+                    {
+                        "timestamp":
+                            timestamp,
+
+                        "data":
+                            packet_data
+                    }
+                )
+
+    return packets
+
+
+# ============================================================
+# DETERMINE PCAP OR PCAPNG
+# ============================================================
+
+def read_saved_capture(
+    file_path
+):
+
+    with open(
+        file_path,
+        "rb"
+    ) as file:
+
+        magic = file.read(4)
+
+    # --------------------------------------------------------
+    # PCAPNG
+    # --------------------------------------------------------
+
+    if magic == b"\x0a\x0d\x0d\x0a":
+
+        print(
+            "Capture format: PCAPNG"
+        )
+
+        return read_pcapng(
+            file_path
+        )
+
+    # --------------------------------------------------------
+    # PCAP
+    # --------------------------------------------------------
+
+    pcap_magics = [
+
+        b"\xd4\xc3\xb2\xa1",
+        b"\xa1\xb2\xc3\xd4",
+        b"\x4d\x3c\xb2\xa1",
+        b"\xa1\xb2\x3c\x4d"
+    ]
+
+    if magic in pcap_magics:
+
+        print(
+            "Capture format: PCAP"
+        )
+
+        return read_pcap(
+            file_path
+        )
 
     raise ValueError(
-        f"Invalid byteorder {byteorder!r}. "
-        "Expected big, little, >, < or !"
-    )
-
-
-def read_u8(data, pos):
-    if pos < 0 or pos + 1 > len(data):
-        raise ValueError(f"Cannot read u8 at offset {pos}")
-
-    return data[pos]
-
-
-def read_u16(data, pos, byteorder="big"):
-    byteorder = normalize_byteorder(byteorder)
-
-    if pos < 0 or pos + 2 > len(data):
-        raise ValueError(f"Cannot read u16 at offset {pos}")
-
-    return int.from_bytes(
-        data[pos:pos + 2],
-        byteorder=byteorder,
-        signed=False
-    )
-
-
-def read_u32(data, pos, byteorder="big"):
-    byteorder = normalize_byteorder(byteorder)
-
-    if pos < 0 or pos + 4 > len(data):
-        raise ValueError(f"Cannot read u32 at offset {pos}")
-
-    return int.from_bytes(
-        data[pos:pos + 4],
-        byteorder=byteorder,
-        signed=False
-    )
-
-
-def read_i32(data, pos, byteorder="big"):
-    byteorder = normalize_byteorder(byteorder)
-
-    if pos < 0 or pos + 4 > len(data):
-        raise ValueError(f"Cannot read i32 at offset {pos}")
-
-    return int.from_bytes(
-        data[pos:pos + 4],
-        byteorder=byteorder,
-        signed=True
+        "File is not recognized as "
+        "PCAP or PCAPNG"
     )
 
 
 # ============================================================
-# GENERIC VALUE DECODERS
+# EXTRACT CUSTOM DATA
 # ============================================================
 
-def decode_uint(data, byteorder):
-    if len(data) == 0:
-        return ""
-
-    return int.from_bytes(
-        data,
-        byteorder=normalize_byteorder(byteorder),
-        signed=False
-    )
-
-
-def decode_int(data, byteorder):
-    if len(data) == 0:
-        return ""
-
-    return int.from_bytes(
-        data,
-        byteorder=normalize_byteorder(byteorder),
-        signed=True
-    )
-
-
-def decode_value(data, byteorder="big", signed=False):
-    """
-    Generic decoder.
-
-    1 byte  -> integer
-    2 bytes -> integer
-    4 bytes -> integer
-    8 bytes -> integer
-
-    Other lengths are returned as a decimal integer too.
-    """
-
-    if not data:
-        return ""
-
-    if signed:
-        return decode_int(data, byteorder)
-
-    return decode_uint(data, byteorder)
-
-
-# ============================================================
-# NETWORK PACKET EXTRACTION
-# ============================================================
-
-def extract_application_payload(packet):
-    """
-    Extract application payload from:
-
-        Ethernet
-        VLAN (optional)
-        IPv4 / IPv6
-        TCP / UDP
-
-    Only returns application payload.
-
-    No network information is written to CSV.
-    """
-
-    if not packet:
-        return b""
+def extract_custom_data(
+    packet_bytes
+):
 
     # --------------------------------------------------------
     # Ethernet
     # --------------------------------------------------------
 
-    if len(packet) < 14:
-        return b""
+    if len(packet_bytes) < 14:
 
-    ether_type = int.from_bytes(
-        packet[12:14],
-        byteorder="big"
-    )
+        raise ValueError(
+            "Ethernet frame is shorter than 14 bytes"
+        )
 
-    pos = 14
+    ether_type = struct.unpack(
+        ">H",
+        packet_bytes[
+            12:14
+        ]
+    )[0]
+
+    offset = 14
 
     # --------------------------------------------------------
     # VLAN
     # --------------------------------------------------------
 
-    while ether_type in (0x8100, 0x88A8, 0x9100):
+    while ether_type in (
+        0x8100,
+        0x88A8
+    ):
 
-        if len(packet) < pos + 4:
-            return b""
+        if len(packet_bytes) < (
+            offset + 4
+        ):
 
-        ether_type = int.from_bytes(
-            packet[pos + 2:pos + 4],
-            byteorder="big"
-        )
+            raise ValueError(
+                "Incomplete VLAN header"
+            )
 
-        pos += 4
+        ether_type = struct.unpack(
+            ">H",
+            packet_bytes[
+                offset + 2:
+                offset + 4
+            ]
+        )[0]
 
-    # --------------------------------------------------------
+        offset += 4
+
+    # ========================================================
     # IPv4
-    # --------------------------------------------------------
+    # ========================================================
 
     if ether_type == 0x0800:
 
-        if len(packet) < pos + 20:
-            return b""
+        if len(packet_bytes) < (
+            offset + 20
+        ):
 
-        version_ihl = packet[pos]
-
-        version = version_ihl >> 4
-
-        if version != 4:
-            return b""
-
-        ihl = (version_ihl & 0x0F) * 4
-
-        if ihl < 20:
-            return b""
-
-        if len(packet) < pos + ihl:
-            return b""
-
-        protocol = packet[pos + 9]
-
-        transport_pos = pos + ihl
-
-        # ----------------------------------------------------
-        # TCP
-        # ----------------------------------------------------
-
-        if protocol == 6:
-
-            if len(packet) < transport_pos + 20:
-                return b""
-
-            tcp_data_offset = (
-                packet[transport_pos + 12] >> 4
-            ) * 4
-
-            if tcp_data_offset < 20:
-                return b""
-
-            payload_pos = (
-                transport_pos + tcp_data_offset
+            raise ValueError(
+                "Incomplete IPv4 header"
             )
 
-            if payload_pos > len(packet):
-                return b""
+        first_byte = packet_bytes[
+            offset
+        ]
 
-            return packet[payload_pos:]
+        version = (
+            first_byte >> 4
+        )
 
-        # ----------------------------------------------------
-        # UDP
-        # ----------------------------------------------------
+        if version != 4:
 
-        if protocol == 17:
+            raise ValueError(
+                "Invalid IPv4 packet"
+            )
 
-            if len(packet) < transport_pos + 8:
-                return b""
+        ihl = (
+            first_byte & 0x0F
+        ) * 4
 
-            payload_pos = transport_pos + 8
+        if ihl < 20:
 
-            if payload_pos > len(packet):
-                return b""
+            raise ValueError(
+                "Invalid IPv4 header length"
+            )
 
-            return packet[payload_pos:]
+        if len(packet_bytes) < (
+            offset + ihl
+        ):
 
-        return packet[transport_pos:]
+            raise ValueError(
+                "Incomplete IPv4 header"
+            )
 
-    # --------------------------------------------------------
+        protocol = packet_bytes[
+            offset + 9
+        ]
+
+        transport_offset = (
+            offset + ihl
+        )
+
+    # ========================================================
     # IPv6
-    # --------------------------------------------------------
+    # ========================================================
 
     elif ether_type == 0x86DD:
 
-        if len(packet) < pos + 40:
-            return b""
-
-        next_header = packet[pos + 6]
-
-        transport_pos = pos + 40
-
-        # Basic IPv6 extension-header handling
-        while next_header in (
-            0,
-            43,
-            44,
-            50,
-            51,
-            60
+        if len(packet_bytes) < (
+            offset + 40
         ):
 
-            if next_header == 44:
-                # Fragment header = 8 bytes
-                if len(packet) < transport_pos + 8:
-                    return b""
-
-                next_header = packet[
-                    transport_pos
-                ]
-
-                transport_pos += 8
-
-            elif next_header == 50:
-                # ESP.
-                # Cannot reliably locate application payload.
-                return b""
-
-            elif next_header == 51:
-                # Authentication header.
-                if len(packet) < transport_pos + 2:
-                    return b""
-
-                next_header_value = packet[
-                    transport_pos
-                ]
-
-                payload_len_units = packet[
-                    transport_pos + 1
-                ]
-
-                header_len = (
-                    (payload_len_units + 2) * 4
-                )
-
-                if len(packet) < transport_pos + header_len:
-                    return b""
-
-                next_header = next_header_value
-
-                transport_pos += header_len
-
-            else:
-                # Hop-by-hop, routing, destination options
-                if len(packet) < transport_pos + 2:
-                    return b""
-
-                next_header_value = packet[
-                    transport_pos
-                ]
-
-                ext_len = (
-                    packet[transport_pos + 1] + 1
-                ) * 8
-
-                if len(packet) < transport_pos + ext_len:
-                    return b""
-
-                next_header = next_header_value
-
-                transport_pos += ext_len
-
-        # ----------------------------------------------------
-        # IPv6 TCP
-        # ----------------------------------------------------
-
-        if next_header == 6:
-
-            if len(packet) < transport_pos + 20:
-                return b""
-
-            tcp_header_len = (
-                packet[transport_pos + 12] >> 4
-            ) * 4
-
-            if tcp_header_len < 20:
-                return b""
-
-            payload_pos = (
-                transport_pos + tcp_header_len
+            raise ValueError(
+                "Incomplete IPv6 header"
             )
 
-            if payload_pos > len(packet):
-                return b""
+        version = (
+            packet_bytes[offset] >> 4
+        )
 
-            return packet[payload_pos:]
+        if version != 6:
 
-        # ----------------------------------------------------
-        # IPv6 UDP
-        # ----------------------------------------------------
+            raise ValueError(
+                "Invalid IPv6 packet"
+            )
 
-        if next_header == 17:
+        protocol = packet_bytes[
+            offset + 6
+        ]
 
-            if len(packet) < transport_pos + 8:
-                return b""
+        transport_offset = (
+            offset + 40
+        )
 
-            payload_pos = transport_pos + 8
+    else:
 
-            if payload_pos > len(packet):
-                return b""
+        raise ValueError(
+            f"Unsupported EtherType: "
+            f"0x{ether_type:04X}"
+        )
 
-            return packet[payload_pos:]
+    # ========================================================
+    # UDP
+    # ========================================================
 
-        return packet[transport_pos:]
+    if protocol == 17:
 
-    # --------------------------------------------------------
-    # Non-IP
-    # --------------------------------------------------------
+        if len(packet_bytes) < (
+            transport_offset + 8
+        ):
 
-    return b""
+            raise ValueError(
+                "Incomplete UDP header"
+            )
+
+        udp_length = struct.unpack(
+            ">H",
+            packet_bytes[
+                transport_offset + 4:
+                transport_offset + 6
+            ]
+        )[0]
+
+        payload_start = (
+            transport_offset + 8
+        )
+
+        if udp_length >= 8:
+
+            payload_length = (
+                udp_length - 8
+            )
+
+            payload_end = (
+                payload_start +
+                payload_length
+            )
+
+            payload_end = min(
+                payload_end,
+                len(packet_bytes)
+            )
+
+            return packet_bytes[
+                payload_start:
+                payload_end
+            ]
+
+        return packet_bytes[
+            payload_start:
+        ]
+
+    # ========================================================
+    # TCP
+    # ========================================================
+
+    if protocol == 6:
+
+        if len(packet_bytes) < (
+            transport_offset + 20
+        ):
+
+            raise ValueError(
+                "Incomplete TCP header"
+            )
+
+        tcp_data_offset = (
+            packet_bytes[
+                transport_offset + 12
+            ] >> 4
+        ) * 4
+
+        if tcp_data_offset < 20:
+
+            raise ValueError(
+                "Invalid TCP header length"
+            )
+
+        payload_start = (
+            transport_offset +
+            tcp_data_offset
+        )
+
+        if payload_start > len(
+            packet_bytes
+        ):
+
+            raise ValueError(
+                "TCP payload is outside packet"
+            )
+
+        return packet_bytes[
+            payload_start:
+        ]
+
+    raise ValueError(
+        f"Unsupported IP protocol: "
+        f"{protocol}"
+    )
 
 
 # ============================================================
-# APPLICATION MESSAGE DECODER
+# PARSE CUSTOM HEADER
 # ============================================================
 
-def decode_single_message(message):
-    """
-    Decode one 130-byte application message.
+def parse_header(
+    custom_data
+):
 
-    Current known information:
-        message size = 130
-        header       = 28
+    if len(custom_data) < HEADER_SIZE:
 
-    Opcode:
-        byte 0
+        raise ValueError(
+            f"Custom data has only "
+            f"{len(custom_data)} bytes. "
+            f"16-byte header required."
+        )
 
-    Target count:
-        byte 1
+    # --------------------------------------------------------
+    # First 16 bytes = header
+    # --------------------------------------------------------
 
-    The remaining protocol-specific structure is NOT present
-    in the uploaded Python file, so the decoder does not invent
-    parameter names/types.
-    """
-
-    result = {
-        "Opcode": "",
-        "Target_Count": "",
-        "Parameters": {},
-        "Targets": []
-    }
-
-    if not message:
-        return result
-
-    if len(message) < 2:
-        return result
+    header = custom_data[
+        :HEADER_SIZE
+    ]
 
     # --------------------------------------------------------
     # Opcode
     # --------------------------------------------------------
 
-    result["Opcode"] = message[OPCODE_OFFSET]
-
-    # --------------------------------------------------------
-    # Target count
-    # --------------------------------------------------------
-
-    result["Target_Count"] = message[
-        TARGET_COUNT_OFFSET
+    opcode = header[
+        OPCODE_OFFSET
     ]
 
-    target_count = result["Target_Count"]
-
     # --------------------------------------------------------
-    # Header
+    # Packet size
     # --------------------------------------------------------
 
-    header_end = min(
-        HEADER_SIZE,
-        len(message)
+    packet_size = read_integer(
+        header,
+        SIZE_OFFSET,
+        SIZE_LENGTH,
+        SIZE_ENDIAN
     )
 
-    header = message[:header_end]
-
     # --------------------------------------------------------
-    # Parameter area
+    # Payload size
     # --------------------------------------------------------
 
-    parameter_area = message[header_end:]
+    if SIZE_INCLUDES_HEADER:
 
-    # --------------------------------------------------------
-    # IMPORTANT
-    #
-    # We cannot safely invent the parameter names here.
-    #
-    # The uploaded file only contained the old guessed fields:
-    # GlobalID, Latitude, Longitude, Altitude, Bitfield, Enum.
-    #
-    # Instead of generating fake parameter names/values,
-    # preserve the parameter area internally.
-    # --------------------------------------------------------
-
-    # If there is no target information, treat this as a
-    # generic opcode message.
-    if target_count == 0:
-        result["Parameters"] = decode_generic_parameters(
-            parameter_area
+        payload_size = (
+            packet_size -
+            HEADER_SIZE
         )
 
-        return result
+    else:
 
-    # --------------------------------------------------------
-    # Target messages
-    #
-    # 130-byte message
-    # 28-byte header
-    # leaves 102 bytes.
-    #
-    # We cannot know the exact target size without the protocol
-    # definition.
-    #
-    # For now, if target count divides 102, divide equally.
-    # --------------------------------------------------------
+        payload_size = packet_size
 
-    if target_count > 0:
+    if payload_size < 0:
 
-        remaining_size = len(parameter_area)
-
-        if remaining_size % target_count == 0:
-
-            target_size = (
-                remaining_size // target_count
-            )
-
-            for index in range(target_count):
-
-                start = (
-                    index * target_size
-                )
-
-                end = (
-                    start + target_size
-                )
-
-                target_data = parameter_area[
-                    start:end
-                ]
-
-                target = decode_generic_target(
-                    target_data
-                )
-
-                result["Targets"].append(
-                    target
-                )
-
-        else:
-
-            # Cannot safely divide the parameter area.
-            # Keep it as one generic target.
-            result["Targets"].append(
-                decode_generic_target(
-                    parameter_area
-                )
-            )
-
-    return result
-
-
-# ============================================================
-# GENERIC PARAMETER DECODER
-# ============================================================
-
-def decode_generic_parameters(data):
-    """
-    Generic decoder used only when there are no targets.
-
-    It does NOT claim to know protocol parameter names.
-
-    Splits data into 4-byte unsigned integers where possible.
-    """
-
-    parameters = {}
-
-    if not data:
-        return parameters
-
-    full_words = len(data) // 4
-
-    for index in range(full_words):
-
-        start = index * 4
-
-        end = start + 4
-
-        value = decode_value(
-            data[start:end],
-            PAYLOAD_BYTEORDER,
-            signed=False
+        raise ValueError(
+            f"Invalid payload size: "
+            f"{payload_size}"
         )
 
-        parameters[
-            f"Parameter_{index + 1}"
-        ] = value
-
-    remainder_start = full_words * 4
-
-    if remainder_start < len(data):
-
-        remainder = data[
-            remainder_start:
-        ]
-
-        parameters[
-            f"Parameter_{full_words + 1}"
-        ] = decode_value(
-            remainder,
-            PAYLOAD_BYTEORDER,
-            signed=False
-        )
-
-    return parameters
-
-
-# ============================================================
-# GENERIC TARGET DECODER
-# ============================================================
-
-def decode_generic_target(data):
-    """
-    Generic target decoder.
-
-    This is intentionally conservative because the actual
-    protocol parameter definition is not present in the
-    uploaded Python file.
-    """
-
-    target = {}
-
-    length = len(data)
-
-    # --------------------------------------------------------
-    # If target has at least 4 bytes
-    # --------------------------------------------------------
-
-    if length >= 4:
-
-        target["GlobalID"] = decode_uint(
-            data[0:4],
-            PAYLOAD_BYTEORDER
-        )
-
-    # --------------------------------------------------------
-    # If target has at least 8 bytes
-    # --------------------------------------------------------
-
-    if length >= 8:
-
-        raw_latitude = decode_int(
-            data[4:8],
-            PAYLOAD_BYTEORDER
-        )
-
-        target["Latitude"] = (
-            raw_latitude / 10000000.0
-        )
-
-    # --------------------------------------------------------
-    # If target has at least 12 bytes
-    # --------------------------------------------------------
-
-    if length >= 12:
-
-        raw_longitude = decode_int(
-            data[8:12],
-            PAYLOAD_BYTEORDER
-        )
-
-        target["Longitude"] = (
-            raw_longitude / 10000000.0
-        )
-
-    # --------------------------------------------------------
-    # If target has at least 16 bytes
-    # --------------------------------------------------------
-
-    if length >= 16:
-
-        raw_altitude = decode_int(
-            data[12:16],
-            PAYLOAD_BYTEORDER
-        )
-
-        target["Altitude"] = (
-            raw_altitude / 1000.0
-        )
-
-    # --------------------------------------------------------
-    # Generic bitfield
-    # --------------------------------------------------------
-
-    if length >= 17:
-
-        bitfield = data[16]
-
-        target["Bitfield"] = bitfield
-
-        for bit in range(8):
-
-            target[
-                f"Bit{bit}"
-            ] = (
-                (bitfield >> bit) & 1
-            )
-
-    # --------------------------------------------------------
-    # Generic enum
-    # --------------------------------------------------------
-
-    if length >= 18:
-
-        target["Enum"] = data[17]
-
-    # --------------------------------------------------------
-    # Remaining target parameters
-    # --------------------------------------------------------
-
-    if length > 18:
-
-        remaining = data[18:]
-
-        full_words = len(remaining) // 4
-
-        for index in range(full_words):
-
-            start = index * 4
-
-            end = start + 4
-
-            target[
-                f"Parameter_{index + 1}"
-            ] = decode_uint(
-                remaining[start:end],
-                PAYLOAD_BYTEORDER
-            )
-
-        remainder_start = full_words * 4
-
-        if remainder_start < len(remaining):
-
-            target[
-                f"Parameter_{full_words + 1}"
-            ] = decode_uint(
-                remaining[remainder_start:],
-                PAYLOAD_BYTEORDER
-            )
-
-    return target
-
-
-# ============================================================
-# SPLIT APPLICATION PAYLOAD INTO 130-BYTE MESSAGES
-# ============================================================
-
-def split_messages(payload):
-    """
-    Splits application payload into 130-byte messages.
-
-    If payload contains:
-
-        130 bytes  -> 1 message
-        260 bytes  -> 2 messages
-        390 bytes  -> 3 messages
-        ...
-
-    Any incomplete trailing bytes are ignored.
-    """
-
-    messages = []
-
-    if not payload:
-        return messages
-
-    position = 0
-
-    while position + MESSAGE_SIZE <= len(payload):
-
-        message = payload[
-            position:
-            position + MESSAGE_SIZE
-        ]
-
-        messages.append(message)
-
-        position += MESSAGE_SIZE
-
-    return messages
-
-
-# ============================================================
-# CSV COLUMN NAME
-# ============================================================
-
-def target_column(parameter_name, target_number):
-    """
-    Creates:
-
-        Parameter[1]
-        Parameter[2]
-        Parameter[3]
-
-    Only for target parameters.
-    """
-
-    return f"{parameter_name}[{target_number}]"
-
-
-# ============================================================
-# PCAPNG CONVERTER
-# ============================================================
-
-def convert_pcapng(input_file, output_file):
-
-    print()
-    print("Reading PCAPNG file...")
-    print()
-
-    with open(input_file, "rb") as f:
-        data = f.read()
-
-    print(
-        "PCAPNG size:",
-        len(data),
-        "bytes"
+    return (
+        header,
+        opcode,
+        packet_size,
+        payload_size
     )
 
-    position = 0
 
-    endian = "little"
+# ============================================================
+# DECODE PRIMITIVE
+# ============================================================
 
-    packet_number = 0
+def decode_primitive(
+    payload,
+    offset,
+    field
+):
 
-    rows = []
+    field_name = field.get(
+        "name",
+        ""
+    )
 
-    all_columns = set()
+    field_type = field.get(
+        "type"
+    )
 
-    max_targets = 0
+    # ========================================================
+    # RAW BYTES
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Process one network packet
-    # --------------------------------------------------------
+    if field_type == "bytes":
 
-    def process_packet(packet):
-
-        nonlocal packet_number
-        nonlocal max_targets
-
-        application_payload = (
-            extract_application_payload(packet)
+        count = int(
+            field.get(
+                "count",
+                1
+            )
         )
 
-        if not application_payload:
-            return
+        if offset + count > len(payload):
 
-        messages = split_messages(
-            application_payload
-        )
-
-        # If application payload is smaller than 130,
-        # try treating the complete payload as one message.
-        if not messages:
-
-            if len(application_payload) >= 2:
-
-                messages = [
-                    application_payload
-                ]
-
-            else:
-
-                return
-
-        for message in messages:
-
-            decoded = decode_single_message(
-                message
+            raise ValueError(
+                f"Not enough bytes for "
+                f"field '{field_name}'"
             )
 
-            packet_number += 1
-
-            row = {
-                "Packet_No": packet_number,
-                "Opcode": decoded["Opcode"],
-                "Target_Count": decoded["Target_Count"]
-            }
-
-            # ------------------------------------------------
-            # Non-target parameters
-            # ------------------------------------------------
-
-            for name, value in decoded[
-                "Parameters"
-            ].items():
-
-                row[name] = value
-
-                all_columns.add(name)
-
-            # ------------------------------------------------
-            # Target parameters
-            # ------------------------------------------------
-
-            targets = decoded["Targets"]
-
-            if len(targets) > max_targets:
-
-                max_targets = len(targets)
-
-            for target_index, target in enumerate(
-                targets,
-                start=1
-            ):
-
-                for name, value in target.items():
-
-                    column = target_column(
-                        name,
-                        target_index
-                    )
-
-                    row[column] = value
-
-                    all_columns.add(column)
-
-            rows.append(row)
-
-    # ========================================================
-    # PCAPNG BLOCK LOOP
-    # ========================================================
-
-    while position + 12 <= len(data):
-
-        # ----------------------------------------------------
-        # Block type
-        # ----------------------------------------------------
-
-        raw_block_type = data[
-            position:
-            position + 4
+        value = payload[
+            offset:
+            offset + count
         ]
 
-        # Section Header Block has special byte pattern.
-        if raw_block_type == b"\x0A\x0D\x0D\x0A":
+        return (
+            value.hex(),
+            offset + count
+        )
 
-            if position + 12 > len(data):
-                break
+    # ========================================================
+    # CHECK DATA TYPE
+    # ========================================================
 
-            byte_order_magic = data[
-                position + 8:
-                position + 12
+    if field_type not in TYPE_INFO:
+
+        raise ValueError(
+            f"Unknown ICD type "
+            f"'{field_type}'"
+        )
+
+    size, fmt = TYPE_INFO[
+        field_type
+    ]
+
+    # --------------------------------------------------------
+    # ICD byte order
+    # --------------------------------------------------------
+
+    endian_prefix = (
+        ">"
+        if SIZE_ENDIAN == "big"
+        else "<"
+    )
+
+    count = int(
+        field.get(
+            "count",
+            1
+        )
+    )
+
+    values = []
+
+    # ========================================================
+    # READ VALUES
+    # ========================================================
+
+    for index in range(count):
+
+        if offset + size > len(payload):
+
+            raise ValueError(
+                f"Not enough payload bytes "
+                f"for '{field_name}'"
+            )
+
+        value = struct.unpack_from(
+            endian_prefix + fmt,
+            payload,
+            offset
+        )[0]
+
+        offset += size
+
+        # ----------------------------------------------------
+        # SCALE
+        # ----------------------------------------------------
+
+        if "scale" in field:
+
+            value *= field[
+                "scale"
             ]
 
-            if byte_order_magic == b"\x1A\x2B\x3C\x4D":
+        # ----------------------------------------------------
+        # OFFSET
+        # ----------------------------------------------------
 
-                endian = "big"
+        if "offset" in field:
 
-            elif byte_order_magic == b"\x4D\x3C\x2B\x1A":
+            value += field[
+                "offset"
+            ]
 
-                endian = "little"
+        # ----------------------------------------------------
+        # ENUM
+        # ----------------------------------------------------
 
-            else:
+        if "enum" in field:
 
-                print(
-                    "WARNING: Invalid PCAPNG byte-order magic."
-                )
+            enum_table = field[
+                "enum"
+            ]
 
-                position += 4
+            if value in enum_table:
 
-                continue
+                value = enum_table[
+                    value
+                ]
 
-            block_length = read_u32(
-                data,
-                position + 4,
-                endian
+        values.append(
+            value
+        )
+
+    # ========================================================
+    # SINGLE VALUE
+    # ========================================================
+
+    if count == 1:
+
+        return (
+            values[0],
+            offset
+        )
+
+    # ========================================================
+    # ARRAY OF PRIMITIVES
+    # ========================================================
+
+    return (
+        values,
+        offset
+    )
+
+
+# ============================================================
+# DECODE STRUCT
+# ============================================================
+
+def decode_struct(
+    node,
+    payload,
+    offset,
+    prefix,
+    context
+):
+
+    decoded = {}
+
+    fields = node.get(
+        "fields",
+        []
+    )
+
+    # ========================================================
+    # DECODE EACH FIELD
+    # ========================================================
+
+    for field in fields:
+
+        field_type = field.get(
+            "type"
+        )
+
+        field_name = field.get(
+            "name",
+            ""
+        )
+
+        # ----------------------------------------------------
+        # PRIMITIVE FIELD
+        # ----------------------------------------------------
+
+        if (
+            field_type in TYPE_INFO
+            or field_type == "bytes"
+        ):
+
+            value, offset = decode_primitive(
+                payload,
+                offset,
+                field
             )
 
-            if block_length < 28:
-                print(
-                    "WARNING: Invalid Section Header Block."
-                )
-                break
+            full_name = (
+                f"{prefix}.{field_name}"
+                if prefix
+                else field_name
+            )
 
-            if (
-                position + block_length
-                > len(data)
-            ):
-                print(
-                    "WARNING: Truncated Section Header Block."
-                )
-                break
+            decoded[
+                full_name
+            ] = value
 
-            position += block_length
+            # ------------------------------------------------
+            # Store context.
+            #
+            # This allows:
+            #
+            # count_from = "num_targets"
+            #
+            # count_from = "num_tracks"
+            # ------------------------------------------------
+
+            if field_type in TYPE_INFO:
+
+                context[
+                    field_name
+                ] = value
 
             continue
 
         # ----------------------------------------------------
-        # Normal block
+        # NESTED NODE
         # ----------------------------------------------------
 
-        try:
-
-            block_type = read_u32(
-                data,
-                position,
-                endian
-            )
-
-            block_length = read_u32(
-                data,
-                position + 4,
-                endian
-            )
-
-        except ValueError:
-
-            break
-
-        if block_length < 12:
-
-            print(
-                "WARNING: Invalid block length:",
-                block_length
-            )
-
-            break
-
-        if (
-            position + block_length
-            > len(data)
+        if field_type in (
+            "struct",
+            "array",
+            "dynamic_array",
+            "mixed"
         ):
 
-            print(
-                "WARNING: Truncated PCAPNG block."
+            child_prefix = (
+                f"{prefix}.{field_name}"
+                if prefix and field_name
+                else field_name
+                if field_name
+                else prefix
             )
 
-            break
+            child_result, offset = decode_node(
+                field,
+                payload,
+                offset,
+                child_prefix,
+                context
+            )
 
-        block = data[
-            position:
-            position + block_length
+            decoded.update(
+                child_result
+            )
+
+            continue
+
+        raise ValueError(
+            f"Unsupported field type "
+            f"'{field_type}' "
+            f"for '{field_name}'"
+        )
+
+    return (
+        decoded,
+        offset
+    )
+
+
+# ============================================================
+# DECODE ARRAY
+# ============================================================
+
+def decode_array(
+    node,
+    payload,
+    offset,
+    prefix,
+    context
+):
+
+    # ========================================================
+    # DETERMINE ARRAY COUNT
+    # ========================================================
+
+    if "count_from" in node:
+
+        count_name = node[
+            "count_from"
         ]
 
-        # ----------------------------------------------------
-        # Interface Description Block
-        #
-        # Type = 1
-        # ----------------------------------------------------
+        if count_name not in context:
 
-        if block_type == 0x00000001:
+            raise ValueError(
+                f"Array '{prefix}' requires "
+                f"count_from='{count_name}', "
+                f"but that field has not "
+                f"been decoded yet"
+            )
 
-            pass
+        count = int(
+            context[
+                count_name
+            ]
+        )
 
-        # ----------------------------------------------------
-        # Legacy Packet Block
-        #
-        # Type = 2
-        # ----------------------------------------------------
+    elif "count" in node:
 
-        elif block_type == 0x00000002:
+        count = int(
+            node[
+                "count"
+            ]
+        )
 
-            if len(block) >= 28:
+    else:
 
-                try:
-
-                    captured_length = read_u32(
-                        block,
-                        20,
-                        endian
-                    )
-
-                    packet_start = 28
-
-                    packet_end = (
-                        packet_start
-                        + captured_length
-                    )
-
-                    # Last 4 bytes = block total
-                    # length, so packet must finish
-                    # before them.
-
-                    if (
-                        packet_end
-                        <= len(block) - 4
-                    ):
-
-                        packet = block[
-                            packet_start:
-                            packet_end
-                        ]
-
-                        process_packet(packet)
-
-                except Exception as e:
-
-                    print(
-                        "WARNING: Error in legacy packet:",
-                        e
-                    )
-
-        # ----------------------------------------------------
-        # Enhanced Packet Block
-        #
-        # Type = 6
-        # ----------------------------------------------------
-
-        elif block_type == 0x00000006:
-
-            if len(block) >= 32:
-
-                try:
-
-                    captured_length = read_u32(
-                        block,
-                        20,
-                        endian
-                    )
-
-                    packet_start = 28
-
-                    packet_end = (
-                        packet_start
-                        + captured_length
-                    )
-
-                    if (
-                        packet_end
-                        <= len(block) - 4
-                    ):
-
-                        packet = block[
-                            packet_start:
-                            packet_end
-                        ]
-
-                        process_packet(packet)
-
-                except Exception as e:
-
-                    print(
-                        "WARNING: Error in enhanced packet:",
-                        e
-                    )
-
-        position += block_length
+        raise ValueError(
+            f"Array '{prefix}' has no "
+            f"'count' or 'count_from'"
+        )
 
     # ========================================================
-    # CREATE CSV HEADER
+    # VALIDATE COUNT
     # ========================================================
 
-    base_columns = [
-        "Packet_No",
-        "Opcode",
-        "Target_Count"
+    if count < 0:
+
+        raise ValueError(
+            f"Negative array count "
+            f"for '{prefix}'"
+        )
+
+    # ========================================================
+    # MAX COUNT
+    # ========================================================
+
+    if "max_count" in node:
+
+        max_count = int(
+            node[
+                "max_count"
+            ]
+        )
+
+        if count > max_count:
+
+            raise ValueError(
+                f"Array '{prefix}' count "
+                f"{count} exceeds max_count "
+                f"{max_count}"
+            )
+
+    # ========================================================
+    # ELEMENT
+    # ========================================================
+
+    if "element" not in node:
+
+        raise ValueError(
+            f"Array '{prefix}' has no "
+            f"'element' definition"
+        )
+
+    element = node[
+        "element"
     ]
 
-    # Separate normal columns and target columns.
-    normal_columns = []
+    decoded = {}
 
-    target_columns = []
+    # ========================================================
+    # DECODE EACH ELEMENT
+    # ========================================================
 
-    for column in all_columns:
+    for index in range(count):
 
-        if "[" in column and column.endswith("]"):
+        element_prefix = (
+            f"{prefix}[{index + 1}]"
+            if prefix
+            else f"[{index + 1}]"
+        )
 
-            target_columns.append(column)
+        element_result, offset = decode_node(
+            element,
+            payload,
+            offset,
+            element_prefix,
+            context
+        )
+
+        decoded.update(
+            element_result
+        )
+
+    return (
+        decoded,
+        offset
+    )
+
+
+# ============================================================
+# DECODE MIXED
+# ============================================================
+
+def decode_mixed(
+    node,
+    payload,
+    offset,
+    prefix,
+    context
+):
+
+    decoded = {}
+
+    blocks = node.get(
+        "blocks",
+        []
+    )
+
+    # ========================================================
+    # DECODE BLOCKS SEQUENTIALLY
+    # ========================================================
+    #
+    # Example:
+    #
+    # mixed
+    #   |
+    #   +-- struct
+    #   |
+    #   +-- array
+    #   |
+    #   +-- struct
+    #   |
+    #   +-- array
+    #
+    # ========================================================
+
+    for block in blocks:
+
+        block_name = block.get(
+            "name"
+        )
+
+        if block_name:
+
+            block_prefix = (
+                f"{prefix}.{block_name}"
+                if prefix
+                else block_name
+            )
 
         else:
 
-            normal_columns.append(column)
+            block_prefix = prefix
 
-    # Sort normal parameter columns.
-    normal_columns.sort()
-
-    # --------------------------------------------------------
-    # Sort target columns naturally:
-    #
-    # GlobalID[1]
-    # Latitude[1]
-    # ...
-    # GlobalID[2]
-    # Latitude[2]
-    # ...
-    # --------------------------------------------------------
-
-    import re
-
-    def target_sort_key(column):
-
-        match = re.match(
-            r"^(.*)\[(\d+)\]$",
-            column
+        block_result, offset = decode_node(
+            block,
+            payload,
+            offset,
+            block_prefix,
+            context
         )
 
-        if not match:
-            return (
-                999999,
-                column
+        decoded.update(
+            block_result
+        )
+
+    return (
+        decoded,
+        offset
+    )
+
+
+# ============================================================
+# DECODE ANY ICD NODE
+# ============================================================
+
+def decode_node(
+    node,
+    payload,
+    offset,
+    prefix,
+    context
+):
+
+    node_type = node.get(
+        "type"
+    )
+
+    # ========================================================
+    # PRIMITIVE
+    # ========================================================
+
+    if (
+        node_type in TYPE_INFO
+        or node_type == "bytes"
+    ):
+
+        value, offset = decode_primitive(
+            payload,
+            offset,
+            node
+        )
+
+        name = node.get(
+            "name"
+        )
+
+        if name:
+
+            full_name = (
+                f"{prefix}.{name}"
+                if prefix
+                else name
             )
 
-        name = match.group(1)
+        else:
 
-        number = int(
-            match.group(2)
-        )
+            full_name = prefix
 
         return (
-            number,
-            name
+            {
+                full_name: value
+            },
+            offset
         )
 
-    target_columns.sort(
-        key=target_sort_key
+    # ========================================================
+    # STRUCT
+    # ========================================================
+
+    if node_type == "struct":
+
+        return decode_struct(
+            node,
+            payload,
+            offset,
+            prefix,
+            context
+        )
+
+    # ========================================================
+    # ARRAY
+    # ========================================================
+
+    if (
+        node_type == "array"
+        or node_type == "dynamic_array"
+    ):
+
+        return decode_array(
+            node,
+            payload,
+            offset,
+            prefix,
+            context
+        )
+
+    # ========================================================
+    # MIXED
+    # ========================================================
+
+    if node_type == "mixed":
+
+        return decode_mixed(
+            node,
+            payload,
+            offset,
+            prefix,
+            context
+        )
+
+    raise ValueError(
+        f"Unsupported ICD node type "
+        f"'{node_type}'"
     )
 
-    full_header = (
-        base_columns
-        + normal_columns
-        + target_columns
+
+# ============================================================
+# DECODE PAYLOAD
+# ============================================================
+
+def decode_payload(
+    opcode,
+    payload
+):
+
+    # ========================================================
+    # UNKNOWN OPCODE
+    # ========================================================
+
+    if opcode not in ICDS:
+
+        return {
+
+            "decode_status":
+                "UNKNOWN_OPCODE",
+
+            "raw_payload":
+                payload.hex()
+        }
+
+    decoded = {
+
+        "decode_status":
+            "OK"
+    }
+
+    icd = ICDS[
+        opcode
+    ]
+
+    # ========================================================
+    # CONTEXT
+    # ========================================================
+    #
+    # Context stores values that can be used by:
+    #
+    # count_from
+    #
+    # Example:
+    #
+    # num_targets = 2
+    #
+    # Target count becomes 2.
+    #
+    # ========================================================
+
+    context = {}
+
+    offset = 0
+
+    try:
+
+        # ----------------------------------------------------
+        # Backward compatibility:
+        #
+        # Old format:
+        #
+        # 104: [
+        #     {...},
+        #     {...}
+        # ]
+        #
+        # Automatically convert to struct.
+        # ----------------------------------------------------
+
+        if isinstance(
+            icd,
+            list
+        ):
+
+            icd = {
+
+                "type": "struct",
+
+                "fields": icd
+            }
+
+        # ----------------------------------------------------
+        # Decode root node
+        # ----------------------------------------------------
+
+        decoded_values, offset = decode_node(
+            icd,
+            payload,
+            offset,
+            "",
+            context
+        )
+
+        decoded.update(
+            decoded_values
+        )
+
+        # ====================================================
+        # REMAINING BYTES
+        # ====================================================
+
+        if offset < len(
+            payload
+        ):
+
+            decoded[
+                "remaining_bytes"
+            ] = payload[
+                offset:
+            ].hex()
+
+        else:
+
+            decoded[
+                "remaining_bytes"
+            ] = ""
+
+    except Exception as exc:
+
+        decoded[
+            "decode_status"
+        ] = "DECODE_ERROR"
+
+        decoded[
+            "decode_error"
+        ] = str(exc)
+
+    return decoded
+
+
+# ============================================================
+# FORMAT TIMESTAMP
+# ============================================================
+
+def format_timestamp(
+    timestamp
+):
+
+    if timestamp is None:
+
+        return ""
+
+    try:
+
+        return datetime.fromtimestamp(
+            timestamp
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )
+
+    except Exception:
+
+        return ""
+
+
+# ============================================================
+# PROCESS ONE PACKET
+# ============================================================
+
+def process_packet(
+    packet_number,
+    packet_info
+):
+
+    raw_packet = packet_info[
+        "data"
+    ]
+
+    timestamp = packet_info[
+        "timestamp"
+    ]
+
+    result = {
+
+        "packet_number":
+            packet_number,
+
+        "timestamp":
+            format_timestamp(
+                timestamp
+            ),
+
+        "pcap_packet_size":
+            len(raw_packet)
+    }
+
+    try:
+
+        # ====================================================
+        # EXTRACT APPLICATION DATA
+        # ====================================================
+
+        custom_data = (
+            extract_custom_data(
+                raw_packet
+            )
+        )
+
+        result[
+            "custom_data_size"
+        ] = len(custom_data)
+
+        # ====================================================
+        # PARSE 16-BYTE HEADER
+        # ====================================================
+
+        (
+            header,
+            opcode,
+            packet_size,
+            payload_size
+        ) = parse_header(
+            custom_data
+        )
+
+        # ====================================================
+        # HEADER INFORMATION
+        # ====================================================
+
+        result[
+            "header_hex"
+        ] = header.hex()
+
+        result[
+            "opcode"
+        ] = opcode
+
+        result[
+            "packet_size"
+        ] = packet_size
+
+        result[
+            "payload_size"
+        ] = payload_size
+
+        # ====================================================
+        # CHECK COMPLETE PACKET
+        # ====================================================
+
+        required_size = (
+            HEADER_SIZE +
+            payload_size
+        )
+
+        if len(custom_data) < (
+            required_size
+        ):
+
+            result[
+                "decode_status"
+            ] = "INCOMPLETE_PACKET"
+
+            result[
+                "error"
+            ] = (
+                f"Header says packet requires "
+                f"{required_size} bytes, "
+                f"but only "
+                f"{len(custom_data)} bytes "
+                f"were saved."
+            )
+
+            return result
+
+        # ====================================================
+        # EXTRACT PAYLOAD
+        # ====================================================
+
+        payload_start = (
+            HEADER_SIZE
+        )
+
+        payload_end = (
+            HEADER_SIZE +
+            payload_size
+        )
+
+        payload = custom_data[
+            payload_start:
+            payload_end
+        ]
+
+        result[
+            "payload_hex"
+        ] = payload.hex()
+
+        # ====================================================
+        # DECODE USING ICD
+        # ====================================================
+
+        decoded = decode_payload(
+            opcode,
+            payload
+        )
+
+        result.update(
+            decoded
+        )
+
+        return result
+
+    except Exception as exc:
+
+        result[
+            "decode_status"
+        ] = "ERROR"
+
+        result[
+            "error"
+        ] = str(exc)
+
+        return result
+
+
+# ============================================================
+# WRITE CSV
+# ============================================================
+
+def write_csv(
+    results,
+    csv_path
+):
+
+    # ========================================================
+    # FIND ALL COLUMNS
+    # ========================================================
+
+    columns = []
+
+    for result in results:
+
+        for key in result:
+
+            if key not in columns:
+
+                columns.append(
+                    key
+                )
+
+    # ========================================================
+    # CREATE DIRECTORY
+    # ========================================================
+
+    directory = os.path.dirname(
+        os.path.abspath(
+            csv_path
+        )
     )
+
+    if directory:
+
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
 
     # ========================================================
     # WRITE CSV
     # ========================================================
 
-    try:
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
 
-        with open(
-            output_file,
-            "w",
-            newline="",
-            encoding="utf-8"
-        ) as f:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=columns
+        )
 
-            writer = csv.DictWriter(
-                f,
-                fieldnames=full_header,
-                extrasaction="ignore"
+        writer.writeheader()
+
+        for result in results:
+
+            row = {}
+
+            for column in columns:
+
+                value = result.get(
+                    column,
+                    ""
+                )
+
+                # ------------------------------------------------
+                # Convert arrays/lists to CSV text
+                # ------------------------------------------------
+
+                if isinstance(
+                    value,
+                    list
+                ):
+
+                    value = ",".join(
+                        str(item)
+                        for item in value
+                    )
+
+                row[
+                    column
+                ] = value
+
+            writer.writerow(
+                row
             )
-
-            writer.writeheader()
-
-            for row in rows:
-
-                writer.writerow(row)
-
-    except PermissionError:
-
-        base, extension = os.path.splitext(
-            output_file
-        )
-
-        fallback = (
-            base
-            + "_"
-            + datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-            + extension
-        )
-
-        print()
-        print(
-            "WARNING: CSV is locked."
-        )
-
-        print(
-            "Writing to:",
-            fallback
-        )
-
-        with open(
-            fallback,
-            "w",
-            newline="",
-            encoding="utf-8"
-        ) as f:
-
-            writer = csv.DictWriter(
-                f,
-                fieldnames=full_header,
-                extrasaction="ignore"
-            )
-
-            writer.writeheader()
-
-            for row in rows:
-
-                writer.writerow(row)
-
-        output_file = fallback
-
-    # ========================================================
-    # RESULT
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("CONVERSION COMPLETED")
-    print("=" * 70)
-
-    print(
-        "Packets/messages decoded:",
-        packet_number
-    )
-
-    print(
-        "Maximum targets:",
-        max_targets
-    )
-
-    print(
-        "CSV columns:",
-        len(full_header)
-    )
-
-    print(
-        "CSV file:",
-        output_file
-    )
-
-    print("=" * 70)
-
-    return packet_number, output_file
 
 
 # ============================================================
@@ -1334,102 +2440,257 @@ def convert_pcapng(input_file, output_file):
 
 def main():
 
-    print("=" * 70)
-    print("PCAPNG TO CSV CONVERTER")
-    print("=" * 70)
     print()
-    print("Message size :", MESSAGE_SIZE)
-    print("Header size  :", HEADER_SIZE)
-    print()
+    print("=" * 70)
 
-    # --------------------------------------------------------
-    # PCAPNG input
-    # --------------------------------------------------------
+    print(
+        "OFFLINE PCAP / PCAPNG -> "
+        "RECURSIVE ICD -> CSV"
+    )
 
-    pcapng_file = input(
-        "Enter the full path of your PCAPNG file: "
-    ).strip().strip('"')
+    print("=" * 70)
 
-    if not os.path.isfile(pcapng_file):
+    # ========================================================
+    # INPUT PCAP
+    # ========================================================
+
+    pcap_path = input(
+        "\nEnter saved PCAP/PCAPNG file path: "
+    ).strip()
+
+    pcap_path = (
+        pcap_path
+        .strip('"')
+        .strip("'")
+    )
+
+    # ========================================================
+    # CHECK FILE
+    # ========================================================
+
+    if not os.path.isfile(
+        pcap_path
+    ):
 
         print()
         print(
-            "ERROR: PCAPNG file not found:"
-        )
-
-        print(pcapng_file)
-
-        input(
-            "\nPress Enter to exit..."
+            "ERROR: Input file does not exist."
         )
 
         return
 
-    # --------------------------------------------------------
-    # Output filename
-    # --------------------------------------------------------
+    # ========================================================
+    # OUTPUT CSV
+    # ========================================================
 
-    default_csv = (
-        os.path.splitext(
-            pcapng_file
-        )[0]
-        + ".csv"
+    csv_path = input(
+        "Enter CSV output file path: "
+    ).strip()
+
+    csv_path = (
+        csv_path
+        .strip('"')
+        .strip("'")
     )
 
+    if not csv_path:
+
+        print()
+        print(
+            "ERROR: CSV path cannot be empty."
+        )
+
+        return
+
+    # ========================================================
+    # READ CAPTURE
+    # ========================================================
+
     print()
-
-    csv_input = input(
-        f"CSV output path [{default_csv}]: "
-    ).strip().strip('"')
-
-    if csv_input:
-
-        csv_file = csv_input
-
-    else:
-
-        csv_file = default_csv
-
-    print()
-    print("Starting conversion...")
-    print()
+    print(
+        "Reading saved capture..."
+    )
 
     try:
 
-        convert_pcapng(
-            pcapng_file,
-            csv_file
+        packets = read_saved_capture(
+            pcap_path
         )
 
-    except KeyboardInterrupt:
+    except Exception as exc:
 
         print()
         print(
-            "Conversion cancelled."
+            "ERROR reading capture:"
         )
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("ERROR")
-        print("=" * 70)
 
         print(
-            type(e).__name__,
-            ":",
-            str(e)
+            exc
         )
 
-        import traceback
+        return
 
-        traceback.print_exc()
-
-        print("=" * 70)
-
-    input(
-        "\nPress Enter to exit..."
+    print(
+        f"Packets found: "
+        f"{len(packets)}"
     )
+
+    # ========================================================
+    # PROCESS PACKETS
+    # ========================================================
+
+    results = []
+
+    successful = 0
+    failed = 0
+
+    print()
+    print(
+        "Extracting packets and "
+        "decoding ICD..."
+    )
+
+    print(
+        "-" * 70
+    )
+
+    for packet_number, packet_info in enumerate(
+        packets,
+        start=1
+    ):
+
+        result = process_packet(
+            packet_number,
+            packet_info
+        )
+
+        results.append(
+            result
+        )
+
+        status = result.get(
+            "decode_status",
+            "ERROR"
+        )
+
+        opcode = result.get(
+            "opcode",
+            ""
+        )
+
+        payload_size = result.get(
+            "payload_size",
+            ""
+        )
+
+        # ====================================================
+        # DISPLAY RESULT
+        # ====================================================
+
+        if status == "OK":
+
+            successful += 1
+
+            print(
+                f"Packet {packet_number}: "
+                f"Opcode={opcode}, "
+                f"Payload={payload_size} bytes, "
+                f"OK"
+            )
+
+        else:
+
+            failed += 1
+
+            print(
+                f"Packet {packet_number}: "
+                f"Opcode={opcode}, "
+                f"Status={status}"
+            )
+
+            error = result.get(
+                "decode_error"
+            )
+
+            if error:
+
+                print(
+                    f"    Error: {error}"
+                )
+
+            error = result.get(
+                "error"
+            )
+
+            if error:
+
+                print(
+                    f"    Error: {error}"
+                )
+
+    # ========================================================
+    # WRITE CSV
+    # ========================================================
+
+    print()
+    print(
+        "Writing CSV..."
+    )
+
+    try:
+
+        write_csv(
+            results,
+            csv_path
+        )
+
+    except Exception as exc:
+
+        print()
+        print(
+            "ERROR writing CSV:"
+        )
+
+        print(
+            exc
+        )
+
+        return
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print()
+    print("=" * 70)
+
+    print(
+        "PROCESSING COMPLETE"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"Input file : {pcap_path}"
+    )
+
+    print(
+        f"Total      : {len(packets)}"
+    )
+
+    print(
+        f"Decoded    : {successful}"
+    )
+
+    print(
+        f"Failed     : {failed}"
+    )
+
+    print(
+        f"CSV file   : {csv_path}"
+    )
+
+    print("=" * 70)
 
 
 # ============================================================
@@ -1437,4 +2698,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
